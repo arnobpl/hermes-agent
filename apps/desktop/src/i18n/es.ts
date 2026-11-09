@@ -1164,6 +1164,7 @@ export const esOverrides = {
         showReasoning: 'Bloques de razonamiento'
       },
       desktop: {
+        enterToSend: 'Enviar con Enter',
         repoScanEnabled: 'Detección automática de repositorios',
         repoScanRoots: 'Carpetas de búsqueda de repositorios',
         repoScanExcludePaths: 'Rutas de repositorio excluidas'
@@ -1339,6 +1340,7 @@ export const esOverrides = {
         showReasoning: 'Muestra secciones de razonamiento cuando el backend las proporcione.'
       },
       desktop: {
+        enterToSend: 'Si se desactiva, Enter inserta una línea nueva; usa el botón Enviar. Es independiente del comportamiento cuando el agente está ocupado.',
         repoScanEnabled: 'Busca repositorios Git en carpetas locales para mostrarlos en Proyectos.',
         repoScanRoots: 'Carpetas que se buscarán. Déjalo vacío para buscar en tu directorio de inicio.',
         repoScanExcludePaths:

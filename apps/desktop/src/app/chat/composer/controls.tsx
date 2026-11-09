@@ -55,6 +55,7 @@ export function ComposerControls({
   compactModelPill = false,
   conversation,
   disabled,
+  enterToSend = true,
   foldVoice = false,
   hasComposerPayload,
   hideModelPill = false,
@@ -75,6 +76,7 @@ export function ComposerControls({
   compactModelPill?: boolean
   conversation: ConversationProps
   disabled: boolean
+  enterToSend?: boolean
   foldVoice?: boolean
   hasComposerPayload: boolean
   hideModelPill?: boolean
@@ -103,6 +105,7 @@ export function ComposerControls({
 
   // A waiting card takes the draft as its answer through Send, whatever the busy action.
   const sendLabel = composerSendLabel(busy && !cardWaiting, busyAction, c)
+  const sendTooltipLabel = showStop ? c.stop : sendLabel
 
   // The HUD is a Spotlight bar a few hundred pixels wide, so the four separate
   // voice toggles fold into one menu there and leave the row to the input. A
@@ -175,13 +178,7 @@ export function ComposerControls({
         <StartVoiceButton disabled={disabled} label={c.startVoice} onStart={conversation.onStart} />
       ) : (
         <Tip
-          label={
-            showStop ? (
-              <TipKeybindLabel actionId="composer.send" text={c.stop} />
-            ) : (
-              <TipKeybindLabel actionId="composer.send" text={sendLabel} />
-            )
-          }
+          label={enterToSend ? <TipKeybindLabel actionId="composer.send" text={sendTooltipLabel} /> : sendTooltipLabel}
           placement="control"
         >
           <Button

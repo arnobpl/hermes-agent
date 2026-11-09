@@ -85,10 +85,13 @@ async def config_get(connection, ref, params):
         from hermes_cli.config_effective import load_user_config_effective
         from hermes_constants import DEFAULT_INDICATOR_STYLE
         from tools.approval_context import _get_approval_mode
+        from utils import is_truthy_value
         home = Path(connection.authority.profile_id)
         with _profile_runtime_scope(home):
             cfg = load_config()
             display = cfg.get('display') or {}
+            desktop = cfg.get('desktop')
+            desktop = desktop if isinstance(desktop, dict) else {}
             getters = {
                 # The user's own settings, not DEFAULT_CONFIG: clients read an absent key as their
                 # own default (the TUI streams unless display.streaming is explicitly false).
@@ -100,6 +103,8 @@ async def config_get(connection, ref, params):
                 'fast': lambda: _fast(connection, ref, policy, agent, cfg),
                 'service_tier': lambda: _service_tier(connection, ref, policy),
                 'daybreak': lambda: {'value': (cfg.get('agent') or {}).get('daybreak') is True},
+                'desktop.enter_to_send': lambda: {'value': str(is_truthy_value(
+                    desktop.get('enter_to_send'), default=True)).lower()},
                 'skin': lambda: {'value': display.get('skin', 'default')},
                 'theme': lambda: {'value': display.get('tui_theme', 'auto')},
                 'indicator': lambda: {'value': display.get('tui_status_indicator', DEFAULT_INDICATOR_STYLE)},

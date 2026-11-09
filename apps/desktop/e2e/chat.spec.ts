@@ -17,8 +17,17 @@ import { expectVisualSnapshot } from './visual-snapshot'
 
 let fixture: MockBackendFixture | null = null
 
+type EnterObservation = {
+  type: string
+  inputType?: string
+  key?: string
+  shiftKey?: boolean
+  defaultPrevented: boolean
+  timeStamp: number
+}
+
 test.beforeAll(async () => {
-  fixture = await setupMockBackend()
+  fixture = await setupMockBackend({ extraConfig: 'desktop:\n  enter_to_send: true\n' })
   await waitForAppReady(fixture!, 120_000)
 })
 
@@ -32,8 +41,93 @@ test.describe('chat interaction with mock backend', () => {
     await runDesktopChatSmoke(fixture!.page, {
       mockUrl: fixture!.mockUrl,
       phase: 'installed',
-      outDir: test.info().outputPath('desktop-chat'),
+      outDir: test.info().outputPath('desktop-chat')
     })
+  })
+
+  test('keeps native Shift+Enter newline after compositionend', async () => {
+    const page = fixture!.page
+
+    const composer = page
+      .locator('[data-slot="composer-root"] [contenteditable="true"]')
+      .filter({ visible: true })
+      .first()
+
+    await composer.fill('first line')
+    await composer.evaluate(element => {
+      const browserWindow = window as typeof window & {
+        __enterToSendEvents?: EnterObservation[]
+        __enterToSendAbortController?: AbortController
+      }
+
+      browserWindow.__enterToSendAbortController?.abort()
+      const abortController = new AbortController()
+      browserWindow.__enterToSendAbortController = abortController
+
+      browserWindow.__enterToSendEvents = []
+
+      for (const type of ['compositionend', 'keydown', 'beforeinput', 'input']) {
+        document.addEventListener(
+          type,
+          event => {
+            browserWindow.__enterToSendEvents?.push({
+              type: event.type,
+              inputType: event instanceof InputEvent ? event.inputType : undefined,
+              key: event instanceof KeyboardEvent ? event.key : undefined,
+              shiftKey: event instanceof KeyboardEvent ? event.shiftKey : undefined,
+              defaultPrevented: event.defaultPrevented,
+              timeStamp: event.timeStamp
+            })
+          },
+          { signal: abortController.signal }
+        )
+      }
+
+      element.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true }))
+      const compositionEnd = new CompositionEvent('compositionend', { bubbles: true })
+      Object.defineProperty(compositionEnd, 'timeStamp', { value: performance.now() + 30 })
+      element.dispatchEvent(compositionEnd)
+    })
+
+    let events: EnterObservation[] = []
+
+    try {
+      await composer.press('Shift+Enter')
+
+      await expect
+        .poll(() => composer.evaluate(element => (element as HTMLElement).innerText))
+        .toContain('first line\n')
+      events = await page.evaluate(() => {
+        const browserWindow = window as typeof window & { __enterToSendEvents?: EnterObservation[] }
+
+        return browserWindow.__enterToSendEvents ?? []
+      })
+    } finally {
+      await page
+        .evaluate(() => {
+          const browserWindow = window as typeof window & {
+            __enterToSendEvents?: EnterObservation[]
+            __enterToSendAbortController?: AbortController
+          }
+
+          browserWindow.__enterToSendAbortController?.abort()
+          delete browserWindow.__enterToSendAbortController
+          delete browserWindow.__enterToSendEvents
+        })
+        .catch(() => undefined)
+      await composer.fill('').catch(() => undefined)
+    }
+
+    const compositionEnd = events.find(event => event.type === 'compositionend')
+    const enterKeydown = events.find(event => event.type === 'keydown' && event.key === 'Enter')
+
+    expect(compositionEnd).toBeDefined()
+    expect(enterKeydown).toMatchObject({ shiftKey: true, defaultPrevented: false })
+    expect(Math.abs(enterKeydown!.timeStamp - compositionEnd!.timeStamp)).toBeLessThanOrEqual(50)
+    expect(events.find(event => event.type === 'beforeinput' && event.inputType === 'insertLineBreak')).toMatchObject({
+      defaultPrevented: false
+    })
+    expect(events.some(event => event.type === 'input')).toBe(true)
   })
 
   test('screenshot of chat with messages', async () => {

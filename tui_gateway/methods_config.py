@@ -11,6 +11,7 @@ from ._env import env_int
 
 from hermes_constants import DEFAULT_INDICATOR_STYLE, INDICATOR_STYLES
 from hermes_constants import display_hermes_home as _display_hermes_home
+from utils import is_truthy_value
 
 _registry = HandlerRegistry()
 method = _registry.method
@@ -254,6 +255,12 @@ def _cfg_get_mtime(params):
     return {"mtime": mtime, "mcp_rev": _compute_mcp_rev()}
 
 
+def _load_desktop_enter_to_send() -> bool:
+    desktop = _load_cfg().get("desktop")
+    value = desktop.get("enter_to_send") if isinstance(desktop, dict) else None
+    return is_truthy_value(value, default=True)
+
+
 # key -> getter(params); bind_module rebinds the table's functions onto server.py's globals.
 _CONFIG_GETTERS = {
     "provider": _cfg_get_provider,
@@ -270,6 +277,7 @@ _CONFIG_GETTERS = {
     "fast": _cfg_get_fast,
     "daybreak": lambda params: {"value": (_load_cfg().get("agent") or {}).get("daybreak") is True},
     "busy": lambda params: {"value": _load_busy_input_mode()},
+    "desktop.enter_to_send": lambda params: {"value": str(_load_desktop_enter_to_send()).lower()},
     "approval_mode": lambda params: {"value": _load_approval_mode()},
     "approvals.mode": lambda params: {"value": _load_approval_mode()},
     "details_mode": lambda params: {"value": _display_word("details_mode", "collapsed", _DETAIL_MODES)},

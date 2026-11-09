@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { $terminalFontFamily, setTerminalFontFamilyFromConfig } from '@/app/right-sidebar/terminal/terminal-font'
 import { getHermesConfig } from '@/hermes'
 import { persistString } from '@/lib/storage'
+import { $enterToSendConfig } from '@/store/enter-to-send'
 import { $showReasoning, setShowReasoningFromConfig } from '@/store/reasoning-disclosure'
 import {
   $currentCwd,
@@ -47,6 +48,7 @@ describe('useHermesConfig refreshHermesConfig', () => {
     setCurrentReasoningEffort('')
     setDefaultReasoningEffort('')
     setTerminalFontFamilyFromConfig('')
+    $enterToSendConfig.set(null)
     persistString(WORKSPACE_CWD_KEY, null)
   })
 
@@ -83,6 +85,22 @@ describe('useHermesConfig refreshHermesConfig', () => {
       await result.current.refreshHermesConfig()
     })
     expect($showToolActivity.get()).toBe(true)
+  })
+
+  it('mirrors the independent Desktop enter-to-send preference and resets a missing key to enabled', async () => {
+    mockConfig({ desktop: { enter_to_send: false } })
+    const { result } = renderHook(() => useHermesConfig({ activeSessionIdRef: { current: null } }))
+
+    await act(async () => {
+      await result.current.refreshHermesConfig()
+    })
+    expect($enterToSendConfig.get()?.enabled).toBe(false)
+
+    mockConfig({})
+    await act(async () => {
+      await result.current.refreshHermesConfig()
+    })
+    expect($enterToSendConfig.get()?.enabled).toBe(true)
   })
 
   // Regression: the composer keeps a manual model pick sticky, which skips the

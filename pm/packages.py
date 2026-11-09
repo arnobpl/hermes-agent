@@ -794,9 +794,11 @@ class Pnpm(BinaryPackage):
     launcher that downloads it, so pm pins both and keeps the launcher's dist/:
     the bundled node-gyp the executable looks for beside itself to build
     dependencies that ship a binding.gyp. Without it a host node-gyp on PATH
-    (or none) would build them."""
+    (or none) would build them. It is build-time only; Docker's frontend build
+    stages request it explicitly."""
 
     name = "pnpm"
+    optional = True
     # Lifecycle scripts and node-gyp run on the node pm installs.
     deps = ("node",)
     binary_rel = {"win32": "pnpm.exe", "posix": "pnpm"}

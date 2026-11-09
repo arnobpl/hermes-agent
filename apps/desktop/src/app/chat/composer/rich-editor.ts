@@ -20,6 +20,74 @@ import { referenceKind, referenceRe, unwrapReferenceValue } from '@/components/a
 import { slashCommandMatches, type SlashCommandScanOptions } from './slash-refs'
 
 export const RICH_INPUT_SLOT = 'composer-rich-input'
+const COMPOSER_LINE_BREAK_ATTRIBUTE = 'data-composer-line-break'
+const COMPOSER_CARET_SENTINEL_ATTRIBUTE = 'data-composer-caret-sentinel'
+
+function isComposerLineBreak(node: Node | null): node is HTMLBRElement {
+  return node?.nodeName === 'BR' && (node as HTMLElement).hasAttribute(COMPOSER_LINE_BREAK_ATTRIBUTE)
+}
+
+function isComposerCaretSentinel(node: Node | null): node is HTMLBRElement {
+  return node?.nodeName === 'BR' && (node as HTMLElement).hasAttribute(COMPOSER_CARET_SENTINEL_ATTRIBUTE)
+}
+
+function createComposerLineBreak() {
+  const br = document.createElement('br')
+
+  br.setAttribute(COMPOSER_LINE_BREAK_ATTRIBUTE, '')
+
+  return br
+}
+
+function createComposerCaretSentinel() {
+  const br = document.createElement('br')
+
+  br.setAttribute(COMPOSER_CARET_SENTINEL_ATTRIBUTE, '')
+
+  return br
+}
+
+function usesWebKitEditableCaretBehavior() {
+  const userAgent = typeof navigator === 'undefined' ? '' : navigator.userAgent
+
+  // Desktop Chromium shares Apple's engine token in its UA string but does
+  // not need WebKit's terminal-break caret workaround. iOS browsers retain
+  // WebKit behavior even when they use a different browser brand token.
+  return /AppleWebKit\//.test(userAgent) && !/(?:Chrome|Chromium|Edg|OPR|SamsungBrowser)\//.test(userAgent)
+}
+
+/** WebKit does not render a caret after a Hermes-authored terminal <br> in
+ * contenteditable. Keep a non-content break after that line so the caret can
+ * sit before it on the otherwise inaccessible final line. */
+function syncComposerCaretSentinel(editor: HTMLElement) {
+  if (editor.dataset.slot !== RICH_INPUT_SLOT) {
+    return
+  }
+
+  const sentinels = Array.from(editor.childNodes).filter(isComposerCaretSentinel)
+  const sentinel = sentinels[0] ?? null
+  const contentNodes = Array.from(editor.childNodes).filter(node => !isComposerCaretSentinel(node))
+  const lastContentNode = contentNodes.at(-1) ?? null
+  const needsSentinel = usesWebKitEditableCaretBehavior() && isComposerLineBreak(lastContentNode)
+
+  for (const extraSentinel of sentinels.slice(1)) {
+    extraSentinel.remove()
+  }
+
+  if (sentinel && (!needsSentinel || sentinel !== editor.lastChild)) {
+    sentinel.remove()
+  }
+
+  if (needsSentinel && !isComposerCaretSentinel(editor.lastChild)) {
+    editor.append(createComposerCaretSentinel())
+  }
+}
+
+function removeComposerCaretSentinel(editor: ParentNode) {
+  for (const sentinel of editor.querySelectorAll(`[${COMPOSER_CARET_SENTINEL_ATTRIBUTE}]`)) {
+    sentinel.remove()
+  }
+}
 
 /** Chromium's litter: editing beside a `contenteditable=false` chip splits the
  *  line and leaves zero-length text nodes behind. They render as nothing and
@@ -64,20 +132,14 @@ function composerCollapsedSelectionContainer(editor: HTMLElement): Node | null {
 }
 
 /** Keep the `data-empty` marker the placeholder paints on in step with the
- *  editor root's contents.
- *
- *  `:empty` can't be the whole test: a cleared editor keeps a scaffolding <br>
- *  so the contenteditable doesn't collapse, and that break makes `:empty`
- *  false. Nor can CSS infer it on its own — a text node is invisible to
- *  selectors, so `one<br>` and a lone `<br>` are the same shape, and
- *  `:has(> br:only-child)` would paint the placeholder over the user's text.
- *  The code that empties the editor is what knows, so it marks it.
+ *  editor root's contents. CSS can't distinguish an unmarked scaffold <br>
+ *  from an empty user line, so the code that clears the editor marks it.
  *
  *  Zero-length text nodes don't count as contents. Chromium leaves them behind
  *  whenever an edit lands next to a `contenteditable=false` chip, and counting
  *  them left an editor the user had emptied looking occupied. */
 export function markEditorEmptiness(editor: HTMLElement) {
-  if (Array.from(editor.childNodes).every(isEmptyTextNode)) {
+  if (Array.from(editor.childNodes).every(node => isEmptyTextNode(node) || isComposerCaretSentinel(node))) {
     editor.dataset.empty = ''
   } else {
     delete editor.dataset.empty
@@ -173,7 +235,7 @@ function appendTextWithBreaks(target: DocumentFragment | HTMLElement, text: stri
 
   lines.forEach((line, index) => {
     if (index > 0) {
-      target.append(document.createElement('br'))
+      target.append(createComposerLineBreak())
     }
 
     if (line) {
@@ -236,6 +298,8 @@ export function renderComposerContents(target: HTMLElement, text: string, option
   // restored draft, a sent message opened for edit) pass `trailingCommitted`.
   appendComposerContents(target, text, options)
 
+  syncComposerCaretSentinel(target)
+
   // The other writer that reshapes the editor root: painting a restored draft
   // in clears the marker, clearing back to '' sets it.
   markEditorEmptiness(target)
@@ -268,6 +332,8 @@ export function serializeTextBefore(editor: HTMLElement, container: Node, offset
   const scratch = document.createElement('div')
 
   scratch.append(probe.cloneContents())
+
+  removeComposerCaretSentinel(scratch)
 
   for (const chip of scratch.querySelectorAll('[data-ref-text]')) {
     chip.replaceWith('\uFFFC')
@@ -306,6 +372,22 @@ function atTokenBoundary(editor: HTMLElement, range: Range | null): boolean {
  *  insert. That's how a paste into an open `@url:` scope replaces the scope
  *  instead of stacking on it (`@url:@url:\`https://…\``). */
 export function insertComposerContentsAtCaret(editor: HTMLElement, text: string, consumeBefore = 0) {
+  // The sentinel only makes a terminal break caret-reachable. Remove it while
+  // editing so inserted content lands before the real end of the draft.
+  removeComposerCaretSentinel(editor)
+
+  // Clear the height-only break before inserting into an empty editor.
+  // Otherwise the real leading newline would serialize as two line breaks.
+  if (
+    editor.dataset.slot === RICH_INPUT_SLOT &&
+    editor.childNodes.length === 1 &&
+    editor.firstChild?.nodeName === 'BR' &&
+    !isComposerLineBreak(editor.firstChild)
+  ) {
+    editor.replaceChildren()
+    placeCaretEnd(editor)
+  }
+
   const scoped = consumeBefore > 0 ? rangeBeforeCaret(editor, consumeBefore) : null
 
   if (scoped) {
@@ -356,6 +438,8 @@ export function insertComposerContentsAtCaret(editor: HTMLElement, text: string,
     selection?.addRange(caret)
   }
 
+  syncComposerCaretSentinel(editor)
+  markEditorEmptiness(editor)
   revealCaret(editor)
 }
 
@@ -565,16 +649,23 @@ export function composerPlainText(node: Node): string {
 
   const el = node as HTMLElement
 
+  if (isComposerCaretSentinel(el)) {
+    return ''
+  }
+
   if (el.dataset.refText) {
     return el.dataset.refText
   }
 
-  // An editor holding nothing but the placeholder <br> is EMPTY. That <br> is
-  // scaffolding normalizeComposerEditorDom adds so the contenteditable keeps
-  // its height — not a line the user typed. Reading it as "\n" is how a
-  // just-cleared composer stayed non-empty: the newline got stashed as the
-  // session's draft and painted back on return.
-  if (el.dataset.slot === RICH_INPUT_SLOT && el.childNodes.length === 1 && el.firstChild?.nodeName === 'BR') {
+  // The unmarked placeholder <br> and caret sentinel are editor scaffolding,
+  // not draft text. Authored line breaks carry their own marker and remain real
+  // content even when they are the editor's only authored child.
+  if (
+    el.dataset.slot === RICH_INPUT_SLOT &&
+    el.childNodes.length === 1 &&
+    el.firstChild?.nodeName === 'BR' &&
+    !isComposerLineBreak(el.firstChild)
+  ) {
     return ''
   }
 
@@ -586,6 +677,46 @@ export function composerPlainText(node: Node): string {
   const block = el.tagName === 'DIV' || el.tagName === 'P'
 
   return block && text && el.dataset.slot !== RICH_INPUT_SLOT ? `${text}\n` : text
+}
+
+/** Copy normal rich-editor content when the selected range includes the
+ *  non-content WebKit caret sentinel. Other selections keep the browser's
+ *  native clipboard behavior. */
+export function copyComposerSelectionWithoutCaretSentinel(editor: HTMLElement, event: ClipboardEvent): boolean {
+  const selection = editor.ownerDocument.getSelection()
+
+  if (!selection || selection.isCollapsed || selection.rangeCount === 0 || !event.clipboardData) {
+    return false
+  }
+
+  const range = selection.getRangeAt(0)
+
+  if (!editor.contains(range.commonAncestorContainer)) {
+    return false
+  }
+
+  const fragment = range.cloneContents()
+
+  if (!fragment.querySelector(`[${COMPOSER_CARET_SENTINEL_ATTRIBUTE}]`)) {
+    return false
+  }
+
+  removeComposerCaretSentinel(fragment)
+
+  const container = editor.ownerDocument.createElement('div')
+  container.dataset.slot = RICH_INPUT_SLOT
+  container.append(fragment)
+
+  try {
+    event.clipboardData.setData('text/plain', composerPlainText(container))
+    event.clipboardData.setData('text/html', container.innerHTML)
+  } catch {
+    return false
+  }
+
+  event.preventDefault()
+
+  return true
 }
 
 export function placeCaretEnd(element: HTMLElement) {
@@ -600,8 +731,16 @@ export function placeCaretEnd(element: HTMLElement) {
   const range = document.createRange()
   const selection = window.getSelection()
 
-  range.selectNodeContents(element)
-  range.collapse(false)
+  const sentinel = isComposerCaretSentinel(element.lastChild) ? element.lastChild : null
+
+  if (sentinel) {
+    range.setStartBefore(sentinel)
+    range.collapse(true)
+  } else {
+    range.selectNodeContents(element)
+    range.collapse(false)
+  }
+
   selection?.removeAllRanges()
   selection?.addRange(range)
   revealCaret(element)
@@ -754,6 +893,18 @@ export function placeCaretAtOffset(editor: HTMLElement, offset: number) {
 
       const el = child as HTMLElement
 
+      if (isComposerCaretSentinel(el)) {
+        if (remaining === 0) {
+          const range = document.createRange()
+          range.setStartBefore(el)
+          range.collapse(true)
+
+          return range
+        }
+
+        continue
+      }
+
       // Chips and <br> are atomic: consume their serialized length whole.
       if (el.dataset.refText || el.tagName === 'BR') {
         const length = el.dataset.refText ? el.dataset.refText.length : 1
@@ -814,8 +965,12 @@ function isBlankNode(node: ChildNode | null): boolean {
     return false
   }
 
-  if (node.nodeName === 'BR') {
+  if (isComposerCaretSentinel(node)) {
     return true
+  }
+
+  if (node.nodeName === 'BR') {
+    return !isComposerLineBreak(node)
   }
 
   if (node.nodeType === Node.TEXT_NODE) {
@@ -833,9 +988,9 @@ function isBlankNode(node: ChildNode | null): boolean {
 
 /** Drop contenteditable junk that serializes as `\n` and falsely expands the
  *  composer. Editing around a contenteditable=false chip makes Chromium wrap the
- *  remainder in stray block <div>s / trailing <br>s — none of which our own
- *  rendering emits (we use text nodes + <br> + chips). Real <br> line breaks
- *  (Shift+Enter, which sit after actual text) are preserved. */
+ *  remainder in stray block <div>s or add trailing <br>s. Our renderer marks
+ *  authored line breaks; unmarked breaks are kept after real text and removed
+ *  when they are only placeholder or chip scaffolding. */
 export function normalizeComposerEditorDom(editor: HTMLElement) {
   const selectedContainer = composerCollapsedSelectionContainer(editor)
 
@@ -890,7 +1045,7 @@ export function normalizeComposerEditorDom(editor: HTMLElement) {
   // A trailing <br> right after a chip / only whitespace is a phantom line.
   const last = editor.lastChild
 
-  if (last?.nodeName === 'BR') {
+  if (last?.nodeName === 'BR' && !isComposerLineBreak(last) && !isComposerCaretSentinel(last)) {
     let prev: ChildNode | null = last.previousSibling
 
     while (prev?.nodeType === Node.TEXT_NODE && !(prev.textContent || '').trim()) {
@@ -901,6 +1056,8 @@ export function normalizeComposerEditorDom(editor: HTMLElement) {
       removeComposerJunk(editor, last)
     }
   }
+
+  syncComposerCaretSentinel(editor)
 
   // ContentEditable elements with no children can visually collapse to
   // near-zero height in some browsers (especially Chromium), causing the

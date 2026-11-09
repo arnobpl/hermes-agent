@@ -1,19 +1,12 @@
 import { ComposerPrimitive } from '@assistant-ui/react'
 import { useStore } from '@nanostores/react'
-import {
-  type ClipboardEvent,
-  type FormEvent,
-  type KeyboardEvent,
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef
-} from 'react'
+import { type ClipboardEvent, type FormEvent, type KeyboardEvent, useCallback, useEffect, useMemo, useRef } from 'react'
 
 import { useTourMarker } from '@/app/chat/tour-marker'
 import type { GatewayRequester } from '@/app/contrib/types'
 import { useHudComposerDrag } from '@/app/hud/composer-drag'
 import { useBusyInputMode } from '@/app/session/hooks/use-busy-input-mode'
+import { useEnterToSend } from '@/app/session/hooks/use-enter-to-send'
 import { composerFloatingStrip, composerInputBacking, composerSurfaceRing } from '@/components/chat/composer-dock'
 import { useSetupChatView } from '@/components/onboarding/first-run/assembly'
 import { OnboardingSkip } from '@/components/onboarding/skip-setup'
@@ -93,6 +86,7 @@ import { renderComposerQueueSlot, useComposerQueueScopeKey } from './queue-slot'
 import { RestoredDraftNotice } from './restored-draft-notice'
 import {
   beginComposerComposition,
+  copyComposerSelectionWithoutCaretSentinel,
   deleteChipBeforeCaret,
   deleteSelectionInEditor,
   insertComposerContentsAtCaret,
@@ -116,6 +110,28 @@ import {
   selectionLinkLabel
 } from './url-refs'
 import { VoiceActivity, VoicePlaybackActivity } from './voice-activity'
+
+// Safari can deliver compositionend before its confirming keydown, despite the keydown timestamp being earlier.
+const COMPOSITION_COMMIT_KEY_WINDOW_MS = 50
+
+type CompositionEndEchoes = {
+  beforeInput: boolean
+  keydown: boolean
+  shiftKey: boolean
+  timeStamp: number
+}
+
+type CompositionEnterEvents = {
+  beforeInput: boolean
+  keydown: boolean
+  shiftKey: boolean
+}
+
+function isRecentCompositionEvent(eventTimeStamp: number, compositionTimeStamp: number | null): boolean {
+  return (
+    compositionTimeStamp !== null && Math.abs(eventTimeStamp - compositionTimeStamp) <= COMPOSITION_COMMIT_KEY_WINDOW_MS
+  )
+}
 
 /** Grid areas for the menu / input / controls row: one row when roomy, input
  *  above menu + controls when stacked, and one area per row once two touch-size
@@ -206,6 +222,14 @@ export function ChatBar({
     requestGateway: requestBusyConfig
   })
 
+  const enterToSend = useEnterToSend({
+    sessionId: sessionId ?? null,
+    storedSessionId: queueSessionKey ?? null,
+    requestGateway: requestBusyConfig
+  })
+
+  const sendOnEnter = enterToSend === true
+
   // Status items (subagents, background processes) are keyed by the RUNTIME
   // session id — gateway events and process.list both speak that id. Only the
   // queue uses the stored-session fallback key (prompts can queue pre-resume).
@@ -254,6 +278,23 @@ export function ChatBar({
   // engine writes it — an explicit shared handle, not a back-reference.
   const queueEditRef = useRef<QueueEditState | null>(null)
   const composingRef = useRef(false) // true during IME composition (CJK input)
+  const pendingCompositionNewlineRef = useRef(false)
+
+  const compositionEnterEventsRef = useRef<CompositionEnterEvents>({
+    beforeInput: false,
+    keydown: false,
+    shiftKey: false
+  })
+
+  const compositionEndedAtRef = useRef<number | null>(null)
+  const compositionEndEchoesRef = useRef<CompositionEndEchoes | null>(null)
+
+  const pendingEnterKeydownRef = useRef<{
+    imeCommit: boolean
+    nativeEvent: globalThis.KeyboardEvent
+  } | null>(null)
+
+  const pendingEnterKeydownTimerRef = useRef<number | null>(null)
   // The blur-close timer must not outlive the composer: an unmounted editor's
   // deferred closeTrigger() would setState after teardown (vitest reported it as
   // an unhandled "window is not defined" from paste-url-is-text.test.tsx).
@@ -263,6 +304,10 @@ export function ChatBar({
     () => () => {
       if (blurCloseTimer.current !== null) {
         window.clearTimeout(blurCloseTimer.current)
+      }
+
+      if (pendingEnterKeydownTimerRef.current !== null) {
+        window.clearTimeout(pendingEnterKeydownTimerRef.current)
       }
     },
     []
@@ -494,16 +539,254 @@ export function ChatBar({
   // flushes to one per paint is lossless.
   const flushRafRef = useRef<number | undefined>(undefined)
 
-  const flushEditorToDraft = (editor: HTMLDivElement, typing = false) => {
-    if (flushRafRef.current !== undefined) {
-      window.cancelAnimationFrame(flushRafRef.current)
-      flushRafRef.current = undefined
+  const flushEditorToDraft = useCallback(
+    (editor: HTMLDivElement, typing = false) => {
+      if (flushRafRef.current !== undefined) {
+        window.cancelAnimationFrame(flushRafRef.current)
+        flushRafRef.current = undefined
+      }
+
+      syncDraftFromEditor(typing, editor)
+
+      window.setTimeout(refreshTrigger, 0)
+    },
+    [refreshTrigger, syncDraftFromEditor]
+  )
+
+  const insertPlainNewlineAtCaret = useCallback(
+    (editor: HTMLDivElement) => {
+      if (inputDisabled) {
+        return
+      }
+
+      recordUndoPoint()
+      insertComposerContentsAtCaret(editor, '\n')
+      flushEditorToDraft(editor)
+    },
+    [flushEditorToDraft, inputDisabled, recordUndoPoint]
+  )
+
+  const handlePlainEnter = useCallback(
+    (editor: HTMLDivElement) => {
+      if (!sendOnEnter) {
+        insertPlainNewlineAtCaret(editor)
+
+        return
+      }
+
+      // Decide from the DOM, not React state. `hasComposerPayload` is derived
+      // from the AUI composer state, which lags the latest keystroke by a
+      // render, so on fast typing / IME the just-typed text isn't in state yet.
+      // Without the live read, a real message typed while prompts are queued
+      // would drain the queue instead of sending. submitDraft() re-syncs and
+      // sends the live editor text.
+      const editorText = liveComposerDraft(editor, draftRef.current)
+      const hasLivePayload = editorText.trim().length > 0 || attachments.length > 0
+
+      if (disabled) {
+        return
+      }
+
+      if (!busy && !hasLivePayload && queuedPrompts.length > 0) {
+        void drainNextQueued()
+
+        return
+      }
+
+      // Empty Enter while busy. With prompts queued this is the double-send:
+      // the first Enter put the words in the queue, a second delivers them
+      // now — steered into the live turn when a steer can carry them, else
+      // promote + interrupt + drain on settle — mirroring the idle empty-Enter
+      // drain above. With nothing queued it stays a no-op — interrupting is
+      // explicit (Stop/Esc), never a stray Enter after sending. Gate on the live
+      // DOM payload (not the render-lagged composer state) so a message typed
+      // fast / via IME while busy still reaches submitDraft() and gets queued
+      // instead of being mistaken for an empty Enter.
+      if (busy && !hasLivePayload) {
+        const head = queuedPrompts.find(entry => entry.id !== queueEdit?.entryId)
+
+        if (head) {
+          void deliverQueuedNow(head.id)
+        }
+
+        return
+      }
+
+      submitDraft()
+    },
+    [
+      attachments.length,
+      busy,
+      deliverQueuedNow,
+      disabled,
+      drainNextQueued,
+      draftRef,
+      insertPlainNewlineAtCaret,
+      queuedPrompts,
+      queueEdit?.entryId,
+      sendOnEnter,
+      submitDraft
+    ]
+  )
+
+  // Soft keyboards can issue native paragraph input without a keydown. Keep
+  // that path on the same Enter policy so the browser cannot add an unmarked
+  // trailing block that normalization later mistakes for editor scaffolding.
+  const handleNativeEditorBeforeInput = useCallback(
+    (event: InputEvent) => {
+      if (event.inputType !== 'insertParagraph' && event.inputType !== 'insertLineBreak') {
+        return
+      }
+
+      const pendingKeydown = pendingEnterKeydownRef.current
+      const keydown = pendingKeydown?.nativeEvent
+      const compositionEndEchoes = compositionEndEchoesRef.current
+
+      const isBeforeInputEcho =
+        compositionEndEchoes?.beforeInput === true &&
+        isRecentCompositionEvent(event.timeStamp, compositionEndEchoes.timeStamp)
+
+      const isQueueChord = Boolean(
+        keydown?.key === 'Enter' && (keydown.metaKey || keydown.ctrlKey) && !keydown.shiftKey
+      )
+
+      if (pendingEnterKeydownTimerRef.current !== null) {
+        window.clearTimeout(pendingEnterKeydownTimerRef.current)
+        pendingEnterKeydownTimerRef.current = null
+      }
+
+      pendingEnterKeydownRef.current = null
+
+      if (compositionEndEchoes && !isRecentCompositionEvent(event.timeStamp, compositionEndEchoes.timeStamp)) {
+        compositionEndEchoesRef.current = null
+      }
+
+      // Enter used to confirm an IME composition, or the keydown path already
+      // handled it (send, queue, or completion). Never process a second native
+      // edit action for that same physical key.
+      if (pendingKeydown?.imeCommit || keydown?.defaultPrevented) {
+        if (isBeforeInputEcho) {
+          compositionEndEchoesRef.current = compositionEndEchoes?.keydown
+            ? { ...compositionEndEchoes, beforeInput: false }
+            : null
+          compositionEndedAtRef.current = null
+        }
+
+        event.preventDefault()
+
+        return
+      }
+
+      if (isBeforeInputEcho) {
+        compositionEndEchoesRef.current = compositionEndEchoes?.keydown
+          ? { ...compositionEndEchoes, beforeInput: false }
+          : null
+        compositionEndedAtRef.current = null
+
+        if (!sendOnEnter || !compositionEndEchoes?.shiftKey) {
+          event.preventDefault()
+        }
+
+        return
+      }
+
+      const editor = editorRef.current
+
+      if (!editor) {
+        return
+      }
+
+      const hasCompositionEndWithoutInputEcho =
+        compositionEndEchoesRef.current?.beforeInput === false &&
+        isRecentCompositionEvent(event.timeStamp, compositionEndEchoesRef.current.timeStamp)
+
+      if (hasCompositionEndWithoutInputEcho) {
+        compositionEndEchoesRef.current = null
+        compositionEndedAtRef.current = null
+
+        if (sendOnEnter && keydown?.shiftKey) {
+          return
+        }
+
+        event.preventDefault()
+        handlePlainEnter(editor)
+
+        return
+      }
+
+      const compositionEndedAt = compositionEndedAtRef.current
+
+      const isCompositionCommitInput =
+        compositionEndEchoesRef.current === null && isRecentCompositionEvent(event.timeStamp, compositionEndedAt)
+
+      if (isCompositionCommitInput) {
+        if (sendOnEnter && keydown?.shiftKey) {
+          compositionEndedAtRef.current = null
+
+          return
+        }
+
+        event.preventDefault()
+
+        if (!sendOnEnter) {
+          handlePlainEnter(editor)
+        }
+
+        compositionEndEchoesRef.current = {
+          beforeInput: false,
+          keydown: true,
+          shiftKey: false,
+          timeStamp: compositionEndedAt!
+        }
+        compositionEndedAtRef.current = null
+
+        return
+      }
+
+      if (event.isComposing || composingRef.current || keydown?.isComposing) {
+        if (isQueueChord) {
+          event.preventDefault()
+        } else if (sendOnEnter && keydown?.shiftKey) {
+          compositionEnterEventsRef.current.beforeInput = true
+          compositionEnterEventsRef.current.shiftKey = true
+
+          return
+        } else {
+          compositionEnterEventsRef.current.beforeInput = true
+          compositionEnterEventsRef.current.shiftKey = keydown?.shiftKey === true
+          pendingCompositionNewlineRef.current = !sendOnEnter
+          event.preventDefault()
+        }
+
+        return
+      }
+
+      // A real Shift+Enter has a preceding keydown and should retain the
+      // browser's native line break when send-on-Enter is enabled. With no
+      // keydown, treat insertLineBreak as a soft-keyboard Enter action.
+      if (sendOnEnter && keydown?.shiftKey) {
+        return
+      }
+
+      event.preventDefault()
+      handlePlainEnter(editor)
+    },
+    [editorRef, handlePlainEnter, sendOnEnter]
+  )
+
+  useEffect(() => {
+    const editor = editorRef.current
+
+    if (!editor) {
+      return
     }
 
-    syncDraftFromEditor(typing, editor)
+    const handleBeforeInput = (event: InputEvent) => handleNativeEditorBeforeInput(event)
 
-    window.setTimeout(refreshTrigger, 0)
-  }
+    editor.addEventListener('beforeinput', handleBeforeInput)
+
+    return () => editor.removeEventListener('beforeinput', handleBeforeInput)
+  }, [editorRef, handleNativeEditorBeforeInput])
 
   // Coalesce the high-frequency input/paste flushes to one per frame. Immediate
   // paths (compositionend, Enter/keydown, submit) keep calling
@@ -561,8 +844,18 @@ export function ChatBar({
   // `beforeinput` event, so Chromium's deleteByCut input type is invisible to
   // it. The native `cut` clipboard event still fires before the DOM mutation,
   // which is where the pre-edit snapshot has to be banked or ⌘Z skips the cut.
-  const handleCut = () => {
+  const handleCopy = (event: ClipboardEvent<HTMLDivElement>) => {
+    copyComposerSelectionWithoutCaretSentinel(event.currentTarget, event.nativeEvent)
+  }
+
+  const handleCut = (event: ClipboardEvent<HTMLDivElement>) => {
     recordUndoPoint()
+
+    if (copyComposerSelectionWithoutCaretSentinel(event.currentTarget, event.nativeEvent)) {
+      if (deleteSelectionInEditor(event.currentTarget)) {
+        flushEditorToDraft(event.currentTarget)
+      }
+    }
   }
 
   const handlePaste = (event: ClipboardEvent<HTMLDivElement>) => {
@@ -676,36 +969,134 @@ export function ChatBar({
     // not composing, trust it and recover.
     if (composingRef.current && !event.nativeEvent.isComposing) {
       composingRef.current = false
+      pendingCompositionNewlineRef.current = false
+      compositionEnterEventsRef.current = { beforeInput: false, keydown: false, shiftKey: false }
+      compositionEndedAtRef.current = null
+      compositionEndEchoesRef.current = null
     }
 
-    // IME composition: Enter confirms composed text, not a message submission.
-    // We check both composingRef (set by compositionstart/compositionend, robust
-    // across browsers) and nativeEvent.isComposing (Chromium fallback).  Without
-    // this guard, pressing Enter to finalise a Korean/Japanese/Chinese IME
-    // preedit fires submitDraft() and splits the message mid-word.
-    if (composingRef.current || event.nativeEvent.isComposing) {
+    const compositionEndedAt = compositionEndedAtRef.current
+    const compositionEndEchoes = compositionEndEchoesRef.current
+
+    const isRecentCompositionEnd =
+      isRecentCompositionEvent(event.nativeEvent.timeStamp, compositionEndedAt) ||
+      (compositionEndEchoes?.keydown === true &&
+        isRecentCompositionEvent(event.nativeEvent.timeStamp, compositionEndEchoes.timeStamp))
+
+    const isCompositionEndShiftEnter =
+      event.key === 'Enter' &&
+      event.shiftKey &&
+      isRecentCompositionEvent(event.nativeEvent.timeStamp, compositionEndedAt)
+
+    const isDistinctCompositionEndEnter =
+      event.key === 'Enter' &&
+      !event.metaKey &&
+      !event.ctrlKey &&
+      !event.shiftKey &&
+      (event.keyCode === 229 || event.nativeEvent.isComposing) &&
+      compositionEndEchoes?.keydown === false &&
+      isRecentCompositionEvent(event.nativeEvent.timeStamp, compositionEndEchoes.timeStamp)
+
+    const isImeCommitKey =
+      event.key === 'Enter' &&
+      !event.metaKey &&
+      !event.ctrlKey &&
+      !event.shiftKey &&
+      (event.keyCode === 229 || event.nativeEvent.isComposing) &&
+      isRecentCompositionEnd
+
+    const compositionEndEnterAlreadyHandled =
+      isImeCommitKey &&
+      compositionEndEchoes?.keydown === true &&
+      isRecentCompositionEvent(event.nativeEvent.timeStamp, compositionEndEchoes.timeStamp)
+
+    if (event.key === 'Enter') {
+      if (pendingEnterKeydownTimerRef.current !== null) {
+        window.clearTimeout(pendingEnterKeydownTimerRef.current)
+      }
+
+      pendingEnterKeydownRef.current = {
+        imeCommit: isImeCommitKey || compositionEndEnterAlreadyHandled,
+        nativeEvent: event.nativeEvent
+      }
+      pendingEnterKeydownTimerRef.current = window.setTimeout(() => {
+        pendingEnterKeydownRef.current = null
+        pendingEnterKeydownTimerRef.current = null
+      }, 0)
+    }
+
+    // Let Enter finish the composition before inserting a configured newline.
+    // Enter-to-send stays suppressed while composing so committed text is not
+    // submitted before the IME has finished.
+    if (isDistinctCompositionEndEnter) {
+      compositionEndEchoesRef.current = null
+      event.preventDefault()
+      handlePlainEnter(event.currentTarget)
+
       return
     }
 
-    // PageUp/PageDown: the composer is a single-line contentEditable — these
-    // keys have no text-editing purpose, and letting their default bubble to
-    // the browser's scroll-the-nearest-scrollable-ancestor behavior breaks the
-    // chat layout in the desktop pane tree (large blank area, sidebar pushed
-    // off-screen — #49978). Swallow the default here; the global
+    if (isCompositionEndShiftEnter) {
+      compositionEndedAtRef.current = null
+      compositionEndEchoesRef.current = null
+
+      if (!sendOnEnter) {
+        event.preventDefault()
+        insertPlainNewlineAtCaret(event.currentTarget)
+      }
+
+      return
+    }
+
+    if (isImeCommitKey) {
+      compositionEndedAtRef.current = null
+
+      if (compositionEndEnterAlreadyHandled) {
+        compositionEndEchoesRef.current = compositionEndEchoes?.beforeInput
+          ? { ...compositionEndEchoes, keydown: false }
+          : null
+        event.preventDefault()
+
+        return
+      }
+
+      compositionEndEchoesRef.current = {
+        beforeInput: true,
+        keydown: false,
+        shiftKey: false,
+        timeStamp: compositionEndedAt ?? compositionEndEchoes?.timeStamp ?? event.nativeEvent.timeStamp
+      }
+
+      if (!sendOnEnter) {
+        event.preventDefault()
+        insertPlainNewlineAtCaret(event.currentTarget)
+      }
+
+      return
+    }
+
+    compositionEndedAtRef.current = null
+    compositionEndEchoesRef.current = null
+
+    if (composingRef.current || event.nativeEvent.isComposing) {
+      if (event.key === 'Enter' && !event.metaKey && !event.ctrlKey) {
+        compositionEnterEventsRef.current.keydown = true
+        compositionEnterEventsRef.current.shiftKey = event.shiftKey
+        pendingCompositionNewlineRef.current = !sendOnEnter
+      }
+
+      return
+    }
+
+    // PageUp/PageDown: these keys have no text-editing purpose in the composer.
+    // Letting them scroll the nearest ancestor breaks the chat layout in the
+    // desktop pane tree, leaving a large blank area and pushing the sidebar
+    // off-screen (#49978). Swallow the default here; the global
     // conversation.scrollPageUp/Down keybind turns the intent into an
     // explicit, focused-transcript page instead.
     if (event.key === 'PageUp' || event.key === 'PageDown') {
       event.preventDefault()
 
-      return
-    }
-
-    // macOS Chinese IME (and some 3rd-party IMEs on Windows) emit Enter with
-    // keyCode 229 (legacy VK_PROCESSKEY) while isComposing is already false.
-    // The compositionend has fired but the keydown still carries 229, signalling
-    // "this Enter is an IME commit, not a user send".  If we let it through,
-    // the message fires before the committed text is fully in the DOM.
-    if (event.key === 'Enter' && event.keyCode === 229) {
       return
     }
 
@@ -793,6 +1184,40 @@ export function ChatBar({
       event.preventDefault()
       triggerKeyConsumedRef.current = true
 
+      return
+    }
+
+    // These Enter policies outrank completion acceptance. A disabled
+    // send-on-Enter setting promises a newline, and the queue chord remains
+    // independent of whether a completion popover is open.
+    if (event.key === 'Enter' && (event.metaKey || event.ctrlKey) && !event.shiftKey) {
+      event.preventDefault()
+
+      if (busy && !disabled) {
+        // Read the live editor so a fast keypress cannot queue a stale draft.
+        const editorText = liveComposerDraft(editorRef.current, draftRef.current)
+
+        if (editorText !== draftRef.current) {
+          draftRef.current = editorText
+          setComposerText(editorText)
+        }
+
+        queueDraft()
+      }
+
+      return
+    }
+
+    if (event.key === 'Enter' && !event.shiftKey && !sendOnEnter) {
+      event.preventDefault()
+      handlePlainEnter(event.currentTarget)
+
+      return
+    }
+
+    // Shift+Enter always inserts a newline; let beforeinput apply the same
+    // native-versus-controlled insertion policy used without completions.
+    if (event.key === 'Enter' && event.shiftKey) {
       return
     }
 
@@ -967,69 +1392,9 @@ export function ChatBar({
       return
     }
 
-    // Cmd/Ctrl+Enter queues a follow-up while a turn runs. Plain Enter steers
-    // a text-only draft, so both live-turn actions stay reachable by keyboard.
-    if (event.key === 'Enter' && (event.metaKey || event.ctrlKey) && !event.shiftKey) {
-      event.preventDefault()
-
-      if (busy && !disabled) {
-        // As with plain Enter, source the just-typed content from the DOM so a
-        // fast keypress cannot queue a stale draft.
-        const editorText = liveComposerDraft(editorRef.current, draftRef.current)
-
-        if (editorText !== draftRef.current) {
-          draftRef.current = editorText
-          setComposerText(editorText)
-        }
-
-        queueDraft()
-      }
-
-      return
-    }
-
     if (event.key === 'Enter' && !event.shiftKey) {
       event.preventDefault()
-
-      // Decide from the DOM, not React state. `hasComposerPayload` is derived
-      // from the AUI composer state, which lags the latest keystroke by a
-      // render, so on fast typing / IME the just-typed text isn't in state yet.
-      // Without the live read, a real message typed while prompts are queued
-      // would drain the queue instead of sending. submitDraft() re-syncs and
-      // sends the live editor text.
-      const editorText = liveComposerDraft(editorRef.current, draftRef.current)
-      const hasLivePayload = editorText.trim().length > 0 || attachments.length > 0
-
-      if (disabled) {
-        return
-      }
-
-      if (!busy && !hasLivePayload && queuedPrompts.length > 0) {
-        void drainNextQueued()
-
-        return
-      }
-
-      // Empty Enter while busy. With prompts queued this is the double-send:
-      // the first Enter put the words in the queue, a second delivers them
-      // now — steered into the live turn when a steer can carry them, else
-      // promote + interrupt + drain on settle — mirroring the idle empty-Enter
-      // drain above. With nothing queued it stays a no-op — interrupting is
-      // explicit (Stop/Esc), never a stray Enter after sending. Gate on the live
-      // DOM payload (not the render-lagged composer state) so a message typed
-      // fast / via IME while busy still reaches submitDraft() and gets queued
-      // instead of being mistaken for an empty Enter.
-      if (busy && !hasLivePayload) {
-        const head = queuedPrompts.find(entry => entry.id !== queueEdit?.entryId)
-
-        if (head) {
-          void deliverQueuedNow(head.id)
-        }
-
-        return
-      }
-
-      submitDraft()
+      handlePlainEnter(event.currentTarget)
 
       return
     }
@@ -1143,6 +1508,7 @@ export function ChatBar({
         status: conversation.status
       }}
       disabled={disabled}
+      enterToSend={sendOnEnter}
       foldVoice={foldVoice}
       hasComposerPayload={hasComposerPayload}
       hideModelPill={guidedChat}
@@ -1191,6 +1557,17 @@ export function ChatBar({
           // guard forever (#44135). Clear unconditionally: by the time blur
           // runs there is nothing left composing in this editor.
           composingRef.current = false
+          pendingCompositionNewlineRef.current = false
+          compositionEnterEventsRef.current = { beforeInput: false, keydown: false, shiftKey: false }
+          compositionEndedAtRef.current = null
+          compositionEndEchoesRef.current = null
+
+          if (pendingEnterKeydownTimerRef.current !== null) {
+            window.clearTimeout(pendingEnterKeydownTimerRef.current)
+            pendingEnterKeydownTimerRef.current = null
+          }
+
+          pendingEnterKeydownRef.current = null
 
           if (blurCloseTimer.current !== null) {
             window.clearTimeout(blurCloseTimer.current)
@@ -1203,6 +1580,10 @@ export function ChatBar({
         }}
         onCompositionEnd={event => {
           composingRef.current = false
+          compositionEndedAtRef.current = event.nativeEvent.timeStamp
+          const compositionEnterEvents = compositionEnterEventsRef.current
+          const insertPendingNewline = pendingCompositionNewlineRef.current
+          pendingCompositionNewlineRef.current = false
 
           // The input events fired *during* composition were skipped (they
           // carried uncommitted preedit text), and Chromium does NOT reliably
@@ -1211,16 +1592,46 @@ export function ChatBar({
           // Chinese "你好", Japanese, Korean) never reaches composer state, so
           // `hasComposerPayload` stays false and the send button stays hidden
           // until an unrelated edit forces a sync (#39614).
-          flushEditorToDraft(event.currentTarget)
+          if (insertPendingNewline && !sendOnEnter && !inputDisabled) {
+            insertPlainNewlineAtCaret(event.currentTarget)
+          } else {
+            flushEditorToDraft(event.currentTarget)
+          }
+
+          if (compositionEnterEvents.keydown || compositionEnterEvents.beforeInput) {
+            const hasPendingEcho = !compositionEnterEvents.keydown || !compositionEnterEvents.beforeInput
+
+            compositionEndEchoesRef.current = hasPendingEcho
+              ? {
+                  beforeInput: !compositionEnterEvents.beforeInput,
+                  keydown: !compositionEnterEvents.keydown,
+                  shiftKey: compositionEnterEvents.shiftKey,
+                  timeStamp: event.nativeEvent.timeStamp
+                }
+              : {
+                  beforeInput: false,
+                  keydown: false,
+                  shiftKey: compositionEnterEvents.shiftKey,
+                  timeStamp: event.nativeEvent.timeStamp
+                }
+            compositionEndedAtRef.current = null
+          }
+
+          compositionEnterEventsRef.current = { beforeInput: false, keydown: false, shiftKey: false }
         }}
         onCompositionStart={event => {
           composingRef.current = true
+          pendingCompositionNewlineRef.current = false
+          compositionEnterEventsRef.current = { beforeInput: false, keydown: false, shiftKey: false }
+          compositionEndedAtRef.current = null
+          compositionEndEchoesRef.current = null
 
           // Input events are skipped for the rest of the composition, so
           // nothing else would clear the empty marker until it ends — and the
           // hint would sit behind the preedit text the whole time (#75960).
           beginComposerComposition(event.currentTarget)
         }}
+        onCopy={handleCopy}
         onCut={handleCut}
         onDragOver={handleInputDragOver}
         onDrop={handleInputDrop}
@@ -1405,7 +1816,7 @@ export function ChatBar({
             }}
             ref={composerRef}
           >
-            {isHelpHint && <HelpHint />}
+            {isHelpHint && <HelpHint enterToSend={sendOnEnter} />}
             {trigger && !argStageEmpty && (
               <ComposerTriggerPopover
                 activeIndex={triggerActive}
@@ -1454,7 +1865,8 @@ export function ChatBar({
                   // track past the surface — and every `w-full` child (the fade,
                   // the input/controls row) laid out against that phantom width
                   // and got clipped by overflow-hidden, send button first.
-                  'group/composer-surface relative z-4 isolate grid grid-cols-[minmax(0,1fr)] grid-rows-[auto_1fr] overflow-hidden rounded-[inherit]', composerSurfaceRing,
+                  'group/composer-surface relative z-4 isolate grid grid-cols-[minmax(0,1fr)] grid-rows-[auto_1fr] overflow-hidden rounded-[inherit]',
+                  composerSurfaceRing,
                   COMPOSER_DROP_FADE_CLASS,
                   dragActive && COMPOSER_DROP_ACTIVE_CLASS
                 )}
@@ -1555,7 +1967,12 @@ export function ChatBarFallback() {
       )}
       data-slot="composer-root"
     >
-      <div className={cn('composer-fallback-surface relative isolate h-(--composer-fallback-height) w-full rounded-[inherit]', composerSurfaceRing)}>
+      <div
+        className={cn(
+          'composer-fallback-surface relative isolate h-(--composer-fallback-height) w-full rounded-[inherit]',
+          composerSurfaceRing
+        )}
+      >
         <div aria-hidden className={composerInputBacking} />
       </div>
     </div>

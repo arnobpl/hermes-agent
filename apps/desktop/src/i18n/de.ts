@@ -1163,6 +1163,7 @@ export const deOverrides = {
         showReasoning: 'Denkblöcke'
       },
       desktop: {
+        enterToSend: 'Mit Enter senden',
         repoScanEnabled: 'Automatische Repository-Erkennung',
         repoScanRoots: 'Repository-Erkennungs-Wurzeln',
         repoScanExcludePaths: 'Ausgeschlossene Repository-Pfade'
@@ -1337,6 +1338,7 @@ export const deOverrides = {
         showReasoning: 'Denkabschnitte anzeigen, wenn das Backend sie liefert.'
       },
       desktop: {
+        enterToSend: 'Wenn deaktiviert, fügt Enter einen Zeilenumbruch ein; zum Senden die Schaltfläche verwenden. Separat vom Verhalten bei laufendem Agenten.',
         repoScanEnabled: 'Lokale Ordner nach Git-Repositories durchsuchen, die in Projekten angezeigt werden.',
         repoScanRoots: 'Zu durchsuchende Ordner. Leer lassen, um Ihr Home-Verzeichnis zu durchsuchen.',
         repoScanExcludePaths: 'Ordner und deren Unterordner, die bei der Repository-Erkennung übersprungen werden.'

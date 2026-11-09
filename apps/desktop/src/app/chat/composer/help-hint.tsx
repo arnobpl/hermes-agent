@@ -19,7 +19,11 @@ const COMPOSER_HOTKEY_ROWS = [
   { id: 'composer.history', combos: ['up', 'down'] }
 ] as const
 
-export function HelpHint() {
+interface HelpHintProps {
+  enterToSend?: boolean
+}
+
+export function HelpHint({ enterToSend = true }: HelpHintProps) {
   const { t } = useI18n()
   const c = t.composer
 
@@ -32,9 +36,21 @@ export function HelpHint() {
       </Section>
 
       <Section title={c.hotkeys}>
-        {COMPOSER_HOTKEY_ROWS.map(row => (
-          <HotkeyRow combos={[...row.combos]} description={c.hotkeyDescs[row.id] ?? ''} key={row.id} />
-        ))}
+        {COMPOSER_HOTKEY_ROWS.map(row => {
+          if (row.id !== 'composer.sendNewline') {
+            return <HotkeyRow combos={[...row.combos]} description={c.hotkeyDescs[row.id] ?? ''} key={row.id} />
+          }
+
+          return enterToSend ? (
+            <HotkeyRow combos={[...row.combos]} description={c.hotkeyDescs[row.id] ?? ''} key={row.id} />
+          ) : (
+            <HotkeyRow
+              combos={['enter', 'shift+enter']}
+              description={t.keybinds.actions['composer.newline']}
+              key={row.id}
+            />
+          )
+        })}
       </Section>
 
       <p className="px-2.5 py-1 text-xs text-muted-foreground/80">

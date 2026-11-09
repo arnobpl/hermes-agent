@@ -2,13 +2,15 @@ import { act, cleanup, fireEvent, render } from '@testing-library/react'
 import { useRef, useState } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import { composerPlainText, RICH_INPUT_SLOT } from './rich-editor'
+
 // No global setupFiles registers auto-cleanup, so unmount between tests —
 // otherwise a second render() leaks the first editor and getByTestId('editor')
 // matches multiple nodes.
 afterEach(cleanup)
 
-// Faithful mirror of index.tsx's Enter wiring (handleEditorKeyDown's Enter
-// branch + submitDraft), driven through REAL DOM keydown events on a
+// Faithful mirror of index.tsx's send-on-Enter wiring (handleEditorKeyDown's
+// send branch + submitDraft), driven through REAL DOM keydown events on a
 // contentEditable.
 //
 // Regression repro for #39630: pressing Enter right after typing (fast typing /
@@ -48,8 +50,6 @@ function Harness({
   const [draft, setDraft] = useState('')
   const attachments: unknown[] = []
 
-  const composerPlainText = (el: HTMLElement) => el.textContent ?? ''
-
   const setText = (next: string) => {
     draftRef.current = next
     setDraft(next)
@@ -88,12 +88,29 @@ function Harness({
   }
 
   const handleKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
-    // PageUp/PageDown: no text-editing purpose in the single-line editor —
+    // PageUp/PageDown: no text-editing purpose in the composer —
     // swallow the default so the browser cannot scroll the nearest ancestor
     // (which breaks the desktop pane layout, #49978). The routed transcript
     // page-scroll lives in the global keybind, not here.
     if (event.key === 'PageUp' || event.key === 'PageDown') {
       event.preventDefault()
+
+      return
+    }
+
+    if (event.key === 'Enter' && (event.metaKey || event.ctrlKey) && !event.shiftKey) {
+      event.preventDefault()
+
+      if (busy && !disabled) {
+        const editorText = editorRef.current ? composerPlainText(editorRef.current) : draftRef.current
+
+        if (editorText !== draftRef.current) {
+          draftRef.current = editorText
+          setDraft(editorText)
+        }
+
+        onQueue(editorText)
+      }
 
       return
     }
@@ -133,18 +150,45 @@ function Harness({
   void draft
 
   return (
-    <div
-      contentEditable
-      data-testid="editor"
-      onInput={event => setText(composerPlainText(event.currentTarget))}
-      onKeyDown={handleKeyDown}
-      ref={editorRef}
-      suppressContentEditableWarning
-    />
+    <>
+      <div
+        contentEditable
+        data-slot={RICH_INPUT_SLOT}
+        data-testid="editor"
+        onInput={event => setText(composerPlainText(event.currentTarget))}
+        onKeyDown={handleKeyDown}
+        ref={editorRef}
+        suppressContentEditableWarning
+      />
+      <button onClick={submitDraft} type="button">
+        Send
+      </button>
+    </>
   )
 }
 
 describe('composer Enter submit — live DOM vs stale composer state (#39630)', () => {
+  it('queues on Ctrl+Enter while the agent is busy', async () => {
+    const onSubmit = vi.fn()
+    const onQueue = vi.fn()
+
+    const { getByTestId } = render(
+      <Harness busy onCancel={vi.fn()} onDrain={vi.fn()} onQueue={onQueue} onSubmit={onSubmit} />
+    )
+
+    const editor = getByTestId('editor')
+    editor.textContent = 'follow up'
+
+    const enter = new KeyboardEvent('keydown', { bubbles: true, cancelable: true, ctrlKey: true, key: 'Enter' })
+    await act(async () => {
+      editor.dispatchEvent(enter)
+    })
+
+    expect(enter.defaultPrevented).toBe(true)
+    expect(onQueue).toHaveBeenCalledWith('follow up')
+    expect(onSubmit).not.toHaveBeenCalled()
+  })
+
   it('sends the just-typed text on Enter even when composer state has not synced', async () => {
     const onSubmit = vi.fn()
 

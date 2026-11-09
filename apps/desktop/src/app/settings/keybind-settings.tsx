@@ -20,6 +20,7 @@ import {
 } from '@/lib/keybinds/actions'
 import { formatCombo } from '@/lib/keybinds/combo'
 import { arraysEqual } from '@/lib/storage'
+import { $enterToSendConfig, enterToSendOwnerKey } from '@/store/enter-to-send'
 import {
   $bindings,
   $capture,
@@ -31,6 +32,8 @@ import {
   resetAllBindings,
   resetBinding
 } from '@/store/keybinds'
+import { $activeGatewayProfile } from '@/store/profile'
+import { $connection } from '@/store/session'
 
 import { HudModifierSettings } from './hud-modifier-settings'
 import { SettingsBreadcrumbContext, SettingsContent } from './primitives'
@@ -67,6 +70,9 @@ function ShortcutSettings({ includeScreenshot }: { includeScreenshot: boolean })
   const { t } = useI18n()
   const hasBreadcrumb = useContext(SettingsBreadcrumbContext)
   const bindings = useStore($bindings)
+  const enterToSendConfig = useStore($enterToSendConfig)
+  const activeProfile = useStore($activeGatewayProfile)
+  const connection = useStore($connection)
   const k = t.keybinds
   const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(new Set())
   // Subscribe so contributed actions appear/disappear live in the map. The
@@ -113,6 +119,23 @@ function ShortcutSettings({ includeScreenshot }: { includeScreenshot: boolean })
     })
   }, [actionList, isSearching, query, k.actions])
 
+  const enterToSendOwner = enterToSendOwnerKey(connection?.connectionId, activeProfile)
+
+  const enterToSendEnabled =
+    enterToSendConfig?.owner === enterToSendOwner &&
+    enterToSendConfig.connection === connection &&
+    enterToSendConfig.enabled
+
+  const readonlyShortcuts = useMemo(() => {
+    if (enterToSendEnabled) {
+      return KEYBIND_READONLY
+    }
+
+    return KEYBIND_READONLY.filter(shortcut => shortcut.id !== 'composer.send' && shortcut.id !== 'composer.steer').map(
+      shortcut => (shortcut.id === 'composer.newline' ? { ...shortcut, keys: ['enter', ...shortcut.keys] } : shortcut)
+    )
+  }, [enterToSendEnabled])
+
   const filteredReadonly = useMemo(() => {
     if (!isSearching) {
       return null
@@ -120,12 +143,12 @@ function ShortcutSettings({ includeScreenshot }: { includeScreenshot: boolean })
 
     const lower = query.toLowerCase()
 
-    return KEYBIND_READONLY.filter(shortcut => {
+    return readonlyShortcuts.filter(shortcut => {
       const label = k.actions[shortcut.id] ?? shortcut.id
 
       return label.toLowerCase().includes(lower) || shortcut.id.includes(lower)
     })
-  }, [isSearching, query, k.actions])
+  }, [isSearching, query, k.actions, readonlyShortcuts])
 
   return (
     <SettingsContent>
@@ -183,7 +206,7 @@ function ShortcutSettings({ includeScreenshot }: { includeScreenshot: boolean })
               action => action.category === category && action.id !== KEYBIND_PANEL_ACTION
             )
 
-            const readonly = KEYBIND_READONLY.filter(shortcut => shortcut.category === category)
+            const readonly = readonlyShortcuts.filter(shortcut => shortcut.category === category)
 
             if (actions.length === 0 && readonly.length === 0) {
               return null

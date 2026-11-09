@@ -7,6 +7,7 @@ import { composerServiceTier } from '@/lib/model-status-label'
 import { normalize } from '@/lib/text'
 import { $busyInputConfig, busyInputOwnerKey, normalizeBusyInputMode } from '@/store/busy-input-mode'
 import { setDisplayTimestampsFromConfig } from '@/store/display-timestamps'
+import { $enterToSendConfig, enterToSendOwnerKey, normalizeEnterToSend } from '@/store/enter-to-send'
 import { $activeGatewayProfile } from '@/store/profile'
 import { localShowReasoning, setShowReasoningFromConfig } from '@/store/reasoning-disclosure'
 import { $connection } from '@/store/session'
@@ -153,6 +154,11 @@ export function useHermesConfig({ activeSessionIdRef }: HermesConfigOptions) {
             owner: busyInputOwnerKey(connection?.connectionId, profile),
             connection,
             mode: normalizeBusyInputMode(config.display?.busy_input_mode)
+          })
+          $enterToSendConfig.set({
+            owner: enterToSendOwnerKey(connection?.connectionId, profile),
+            connection,
+            enabled: normalizeEnterToSend(config.desktop?.enter_to_send)
           })
         }
 

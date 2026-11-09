@@ -21,6 +21,8 @@ def test_client_config_projection_keeps_session_policy_and_secrets_private(tmp_p
                 config.update(voice={'record_key': 'ctrl+r', 'submit_mode': 'draft', 'api_key': 'PRIVATE_VOICE'},
                               paste_collapse_threshold=12)
                 config['display'].update(tui_theme='light', bell_on_complete=True)
+                config['display']['busy_input_mode'] = 'queue'
+                config.setdefault('desktop', {})['enter_to_send'] = False
                 config['approvals'] = {'mode': 'manual'}
                 (home / 'config.yaml').write_text(yaml.safe_dump(config))
                 before = (home / 'config.yaml').read_bytes()
@@ -28,6 +30,10 @@ def test_client_config_projection_keeps_session_policy_and_secrets_private(tmp_p
                 assert full.get('result', {}).get('config', {}).get('voice', {}).get('record_key') == 'ctrl+r', full
                 assert 'PRIVATE_VOICE' not in json.dumps(full)
                 assert full['result']['config']['display']['bell_on_complete'] is True
+                enter_to_send = await rpc(ws, 'config.get', key='desktop.enter_to_send', session_id=sid)
+                busy_mode = await rpc(ws, 'config.get', key='busy', session_id=sid)
+                assert enter_to_send['result']['value'] == 'false'
+                assert busy_mode['result']['value'] == 'queue'
                 # The user's settings, not DEFAULT_CONFIG: an unset display.streaming stays unset.
                 assert 'streaming' not in full['result']['config']['display']
                 mtime = (await rpc(ws, 'config.get', key='mtime', session_id=sid))['result']

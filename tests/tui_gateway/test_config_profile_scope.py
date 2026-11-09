@@ -90,6 +90,26 @@ def test_config_get_full_reads_params_profile_yaml_not_launch(tmp_path, monkeypa
     assert _read_yaml(launch)["terminal"]["cwd"] == LAUNCH_CWD
 
 
+def test_enter_to_send_getter_defaults_true_and_reads_the_selected_profile(tmp_path, monkeypatch):
+    launch, worker = _homes(tmp_path)
+    _bind_homes(monkeypatch, launch, worker)
+
+    # The default is available to older config files that predate this preference.
+    assert _get({"key": "desktop.enter_to_send"})["result"]["value"] == "true"
+
+    launch_config = _read_yaml(launch)
+    launch_config["desktop"]["enter_to_send"] = False
+    (launch / "config.yaml").write_text(yaml.safe_dump(launch_config), encoding="utf-8")
+    worker_config = _read_yaml(worker)
+    worker_config["desktop"]["enter_to_send"] = True
+    (worker / "config.yaml").write_text(yaml.safe_dump(worker_config), encoding="utf-8")
+
+    assert _get({"key": "desktop.enter_to_send"})["result"]["value"] == "false"
+    assert _get({"key": "desktop.enter_to_send", "profile": "code"})["result"]["value"] == "true"
+    # Sending behavior stays independent from the busy-input policy.
+    assert _get({"key": "busy", "profile": "code"})["result"]["value"] == "queue"
+
+
 def test_config_set_persistent_write_lands_on_params_profile_yaml(tmp_path, monkeypatch):
     launch, worker = _homes(tmp_path)
     _bind_homes(monkeypatch, launch, worker)

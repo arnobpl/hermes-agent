@@ -147,6 +147,16 @@ describe('ComposerControls shortcut tooltips', () => {
     await expectShortcutTooltip('Steer the current run', '↵')
   })
 
+  it('omits the Enter shortcut from Send when enter-to-send is disabled', async () => {
+    renderControls({ enterToSend: false })
+    fireEvent.pointerMove(screen.getByLabelText('Send'), { pointerType: 'mouse' })
+
+    const tooltip = await screen.findByRole('tooltip')
+
+    expect(tooltip.textContent).toContain('Send')
+    expect(tooltip.textContent).not.toContain('↵')
+  })
+
   it('shows Stop only when the composer is empty mid-turn', async () => {
     renderControls({ busy: true, busyAction: 'stop', canSubmit: true, hasComposerPayload: false })
 

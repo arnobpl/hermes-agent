@@ -11,9 +11,11 @@ import io
 import json
 import tarfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+import pm.install as pm_install
 from pm import Lockfile, get_package, paths
 from pm.install import _prepare_artifacts
 from pm.store import ALL_TARGETS
@@ -51,6 +53,19 @@ def test_every_target_with_a_pinned_node_can_install_the_js_workspaces():
             continue
         assert package.missing_reason(target) is None, target
         assert [a["url"] for a in lock.artifacts("pnpm", target)] == package.fetch_urls(version, target), target
+
+
+def test_missing_pnpm_is_not_reported_as_runtime_drift(tmp_path, monkeypatch):
+    facts_path = tmp_path / "facts.json"
+    facts_path.touch()
+    monkeypatch.setattr(paths, "facts_path", lambda: facts_path)
+    monkeypatch.setattr(paths, "runtime_facts_path", lambda: tmp_path / "runtime-facts.json")
+    monkeypatch.setattr(pm_install, "_lockfile", lambda: SimpleNamespace(names=lambda: ["pnpm"]))
+    monkeypatch.setattr(pm_install, "_facts", dict)
+    monkeypatch.setattr(pm_install, "current_target", lambda: "linux-x64")
+    monkeypatch.setattr(pm_install, "_installed_location", lambda *_args, **_kwargs: None)
+
+    assert pm_install.drift(include_venv=False) == {}
 
 
 @pytest.mark.parametrize("target", ["linux-x64", "win32-x64", "linux-arm64-bionic"])

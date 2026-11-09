@@ -7,6 +7,7 @@ import {
   caretOffsetInEditor,
   caretRevealScrollTop,
   composerPlainText,
+  copyComposerSelectionWithoutCaretSentinel,
   deleteSelectionInEditor,
   insertComposerContentsAtCaret,
   normalizeComposerEditorDom,
@@ -19,13 +20,25 @@ import {
 } from './rich-editor'
 import { placeCaretAtEnd } from './test-utils'
 
+const WEBKIT_USER_AGENT =
+  'Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Mobile/15E148 Safari/604.1'
+
+const CHROMIUM_USER_AGENT =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36'
+
+function useUserAgent(userAgent: string) {
+  Object.defineProperty(navigator, 'userAgent', { configurable: true, value: userAgent })
+}
+
 beforeEach(() => {
+  useUserAgent(CHROMIUM_USER_AGENT)
   rememberDesktopCommandsCatalog({
     commands: { '/goal': { argument_mode: 'mixed', desktop: null } }
   })
 })
 
 afterEach(() => {
+  useUserAgent(CHROMIUM_USER_AGENT)
   rememberDesktopCommandsCatalog(undefined)
 })
 
@@ -41,6 +54,36 @@ describe('renderComposerContents', () => {
     expect(editor.textContent).toContain('<img src=x onerror=alert(1)>')
     expect(editor.textContent).toContain('<b>raw</b>')
     expect(composerPlainText(editor)).toBe('@file:`<img src=x onerror=alert(1)>` <b>raw</b>')
+  })
+
+  it('omits the caret sentinel from copied text and HTML', () => {
+    useUserAgent(WEBKIT_USER_AGENT)
+    const editor = document.createElement('div')
+    editor.dataset.slot = RICH_INPUT_SLOT
+    document.body.append(editor)
+    renderComposerContents(editor, 'one\n')
+
+    const range = document.createRange()
+    range.selectNodeContents(editor)
+    const selection = window.getSelection()!
+    selection.removeAllRanges()
+    selection.addRange(range)
+
+    const setData = vi.fn()
+    const preventDefault = vi.fn()
+
+    const event = {
+      clipboardData: { setData },
+      preventDefault
+    } as unknown as ClipboardEvent
+
+    expect(copyComposerSelectionWithoutCaretSentinel(editor, event)).toBe(true)
+    expect(preventDefault).toHaveBeenCalledOnce()
+    expect(setData).toHaveBeenNthCalledWith(1, 'text/plain', 'one\n')
+    expect(setData).toHaveBeenNthCalledWith(2, 'text/html', expect.not.stringContaining('data-composer-caret-sentinel'))
+
+    selection.removeAllRanges()
+    editor.remove()
   })
 
   it('hydrates a committed leading slash command back to its pill', () => {
@@ -78,6 +121,44 @@ describe('renderComposerContents', () => {
 
     expect(editor.querySelector('[data-slash-kind]')).toBeNull()
     expect(composerPlainText(editor)).toBe('/goal ship the redesign')
+  })
+
+  it('adds a non-serialized caret sentinel after a trailing newline', () => {
+    useUserAgent(WEBKIT_USER_AGENT)
+    const editor = document.createElement('div')
+    editor.dataset.slot = RICH_INPUT_SLOT
+    document.body.append(editor)
+
+    renderComposerContents(editor, 'one\n')
+
+    const sentinel = editor.querySelector('[data-composer-caret-sentinel]')
+
+    expect(sentinel).not.toBeNull()
+    expect(composerPlainText(editor)).toBe('one\n')
+
+    placeCaretEnd(editor)
+
+    expect(caretOffsetInEditor(editor)).toBe(4)
+    expect(window.getSelection()?.anchorNode).toBe(editor)
+    expect(window.getSelection()?.anchorOffset).toBe(editor.childNodes.length - 1)
+
+    placeCaretAtOffset(editor, 4)
+
+    expect(window.getSelection()?.anchorNode).toBe(editor)
+    expect(window.getSelection()?.anchorOffset).toBe(editor.childNodes.length - 1)
+
+    editor.remove()
+  })
+
+  it('does not add a WebKit caret sentinel in Chromium', () => {
+    useUserAgent(CHROMIUM_USER_AGENT)
+    const editor = document.createElement('div')
+    editor.dataset.slot = RICH_INPUT_SLOT
+
+    renderComposerContents(editor, 'one\n')
+
+    expect(composerPlainText(editor)).toBe('one\n')
+    expect(editor.querySelector('[data-composer-caret-sentinel]')).toBeNull()
   })
 })
 
@@ -276,6 +357,26 @@ describe('insertInlineRefsIntoEditor', () => {
 })
 
 describe('insertComposerContentsAtCaret', () => {
+  it('keeps a newline inserted into an empty placeholder as real content', () => {
+    const editor = document.createElement('div')
+    editor.dataset.slot = RICH_INPUT_SLOT
+    document.body.append(editor)
+    normalizeComposerEditorDom(editor)
+    placeCaretEnd(editor)
+
+    insertComposerContentsAtCaret(editor, '\n')
+
+    expect(composerPlainText(editor)).toBe('\n')
+    normalizeComposerEditorDom(editor)
+    expect(composerPlainText(editor)).toBe('\n')
+
+    renderComposerContents(editor, '\n')
+    normalizeComposerEditorDom(editor)
+    expect(composerPlainText(editor)).toBe('\n')
+
+    editor.remove()
+  })
+
   it('inserts multiline text as text nodes + br', () => {
     const editor = document.createElement('div')
     editor.dataset.slot = RICH_INPUT_SLOT
@@ -286,6 +387,68 @@ describe('insertComposerContentsAtCaret', () => {
 
     expect(editor.querySelectorAll('br').length).toBe(2)
     expect(composerPlainText(editor)).toBe('one\ntwo\nthree')
+
+    editor.remove()
+  })
+
+  it('keeps repeated trailing newlines reachable and inserts text before the sentinel', () => {
+    useUserAgent(WEBKIT_USER_AGENT)
+    const editor = document.createElement('div')
+    editor.dataset.slot = RICH_INPUT_SLOT
+    document.body.append(editor)
+
+    renderComposerContents(editor, 'typed text')
+    placeCaretEnd(editor)
+    insertComposerContentsAtCaret(editor, '\n')
+
+    expect(composerPlainText(editor)).toBe('typed text\n')
+    expect(editor.querySelectorAll('[data-composer-line-break]')).toHaveLength(1)
+    expect(editor.querySelectorAll('[data-composer-caret-sentinel]')).toHaveLength(1)
+
+    placeCaretEnd(editor)
+    insertComposerContentsAtCaret(editor, '\n')
+
+    expect(composerPlainText(editor)).toBe('typed text\n\n')
+    expect(editor.querySelectorAll('[data-composer-line-break]')).toHaveLength(2)
+    expect(editor.querySelectorAll('[data-composer-caret-sentinel]')).toHaveLength(1)
+    expect(caretOffsetInEditor(editor)).toBe('typed text\n\n'.length)
+
+    placeCaretEnd(editor)
+    insertComposerContentsAtCaret(editor, 'next')
+
+    expect(composerPlainText(editor)).toBe('typed text\n\nnext')
+    expect(editor.querySelector('[data-composer-caret-sentinel]')).toBeNull()
+
+    editor.remove()
+  })
+
+  it('does not keep a caret sentinel after the draft is cleared', () => {
+    useUserAgent(WEBKIT_USER_AGENT)
+    const editor = document.createElement('div')
+    editor.dataset.slot = RICH_INPUT_SLOT
+    document.body.append(editor)
+
+    renderComposerContents(editor, 'typed text\n')
+    editor.replaceChildren()
+    normalizeComposerEditorDom(editor)
+
+    expect(composerPlainText(editor)).toBe('')
+    expect(editor.querySelector('[data-composer-caret-sentinel]')).toBeNull()
+
+    editor.remove()
+  })
+
+  it('leaves native terminal line breaks under browser caret management', () => {
+    useUserAgent(WEBKIT_USER_AGENT)
+    const editor = document.createElement('div')
+    editor.dataset.slot = RICH_INPUT_SLOT
+    editor.append(document.createTextNode('one'), document.createElement('br'))
+    document.body.append(editor)
+
+    normalizeComposerEditorDom(editor)
+
+    expect(composerPlainText(editor)).toBe('one\n')
+    expect(editor.querySelector('[data-composer-caret-sentinel]')).toBeNull()
 
     editor.remove()
   })

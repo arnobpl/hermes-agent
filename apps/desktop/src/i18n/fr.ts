@@ -1168,6 +1168,7 @@ export const frOverrides = {
         showReasoning: 'Blocs de raisonnement'
       },
       desktop: {
+        enterToSend: 'Envoyer avec Entrée',
         repoScanEnabled: 'Découverte automatique de dépôts',
         repoScanRoots: 'Racines de découverte de dépôts',
         repoScanExcludePaths: 'Chemins de dépôt exclus'
@@ -1343,6 +1344,7 @@ export const frOverrides = {
         showReasoning: 'Afficher les sections de raisonnement quand le backend les fournit.'
       },
       desktop: {
+        enterToSend: 'Désactivé, Entrée insère un saut de ligne ; utilisez le bouton Envoyer. Indépendant du comportement lorsque l’agent travaille.',
         repoScanEnabled: 'Analyser les dossiers locaux à la recherche de dépôts Git à afficher dans Projets.',
         repoScanRoots: 'Dossiers à analyser. Laissez vide pour analyser votre répertoire personnel.',
         repoScanExcludePaths: 'Dossiers et leurs descendants à ignorer lors de la découverte de dépôts.'
