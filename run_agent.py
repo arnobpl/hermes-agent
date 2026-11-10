@@ -923,6 +923,7 @@ class AIAgent(
         cache eviction: the session may resume on the same task_id, so processes, sandbox, browser and computer-use
         are kept). Idempotent; distinct from ``close()``."""
         self._close_active_children(soft=True)
+        _quietly(self._close_codex_responses_websocket)
         # Retire (don't hard-close) the shared client: eviction runs on the gateway memory-manager thread,
         # and a cross-thread close can release TLS FDs under a still-unwinding worker.
         _quietly(self._drop_shared_client, lambda c: self._retire_shared_openai_client(c, reason="cache_evict"))
@@ -944,6 +945,7 @@ class AIAgent(
         self._close_active_children(soft=False)
         from agent.prepared_compaction import release_for_agent
         _quietly(release_for_agent, self)
+        _quietly(self._close_codex_responses_websocket)
         _quietly(self._drop_shared_client, lambda c: self._close_openai_client(c, reason="agent_close", shared=True))
         self._close_request_clients("agent_close")
         _quietly(self._close_codex_session)

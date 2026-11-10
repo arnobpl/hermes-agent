@@ -1189,6 +1189,23 @@ def _sanitize_consumer_codex_request(agent: Any, request: dict[str, Any]) -> dic
     return sanitized
 
 
+def _codex_request_input_size(value: Any) -> int:
+    try:
+        return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    except (TypeError, ValueError):
+        return -1
+
+
+def _is_official_codex_websocket_route(agent: Any, client: Any) -> bool:
+    """Keep the experimental WebSocket transport on the official HTTPS Codex OAuth route."""
+    backend_predicate = getattr(agent, "_is_codex_backend", None)
+    if (str(getattr(agent, "provider", "") or "").strip().lower() != "openai-codex"
+            or not callable(backend_predicate) or not bool(backend_predicate())):
+        return False
+    from agent.codex_headers import is_official_codex_base_url
+    return is_official_codex_base_url(str(getattr(client, "base_url", "") or ""))
+
+
 def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta=None):
     """One streaming Responses API request over raw ``responses.create(stream=True)`` events."""
     import httpx as _httpx
@@ -1211,7 +1228,10 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     # Delta-sink claim for the CURRENT physical attempt (None until the stream opens). A newer attempt that
     # claims the sink supersedes this token; that only silences OUR live callbacks — consumption continues,
     # because stopping here handed the gateway a "completed" response missing its tail (#69486).
-    writer_token = {"value": None, "raw_stream": None, "superseded_logged": False}
+    writer_token = {
+        "value": None, "raw_stream": None, "superseded_logged": False,
+        "websocket": False, "websocket_session": None, "websocket_plan": None,
+    }
 
     def _request_is_current() -> bool:
         return request_token is None or getattr(agent, "_active_codex_stream_request_token", None) is request_token
@@ -1285,6 +1305,47 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             )
         stream_kwargs = _sanitize_consumer_codex_request(agent, next_api_kwargs)
         stream_kwargs["stream"] = True
+        if (bool(getattr(agent, "_codex_responses_websocket_enabled", False))
+                and _is_official_codex_websocket_route(agent, active_client)):
+            from agent.codex_responses_websocket import (
+                CodexWebSocketConnectError, CodexWebSocketSendError, CodexWebSocketUnavailable,
+                get_agent_session,
+            )
+            ws_session = get_agent_session(agent, active_client)
+            try:
+                ws_stream = ws_session.open_response(stream_kwargs)
+            except CodexWebSocketConnectError as exc:
+                logger.warning(
+                    "Codex Responses WebSocket connection setup failed; using HTTP for this agent turn. %s error=%s",
+                    agent._client_log_context(), exc,
+                )
+            except CodexWebSocketSendError:
+                # Delivery is ambiguous after response.create send begins. Mark this
+                # attempt before Relay can wrap the exception so no future retry branch
+                # can treat it as a safe pre-stream HTTP connection failure.
+                writer_token["websocket"] = True
+                raise
+            except CodexWebSocketUnavailable as exc:
+                logger.debug("Codex Responses WebSocket unavailable for this request; using HTTP: %s", exc)
+            else:
+                writer_token["websocket"] = True
+                writer_token["websocket_session"] = ws_session
+                writer_token["websocket_plan"] = ws_stream.plan
+                logger.info(
+                    "Codex Responses request transport=websocket mode=%s input_items=%d/%d input_bytes=%d/%d",
+                    "incremental" if ws_stream.plan.incremental else "full",
+                    len(ws_stream.plan.payload.get("input", [])), len(ws_stream.plan.full_input),
+                    ws_stream.plan.sent_input_bytes, ws_stream.plan.full_input_bytes,
+                )
+                return ws_stream
+        writer_token["websocket"] = False
+        writer_token["websocket_session"] = None
+        writer_token["websocket_plan"] = None
+        logger.info(
+            "Codex Responses request transport=http input_items=%d input_bytes=%d",
+            len(stream_kwargs.get("input", [])) if isinstance(stream_kwargs.get("input"), list) else -1,
+            _codex_request_input_size(stream_kwargs.get("input")),
+        )
         return active_client.responses.create(**bypass_sdk_request_transform(stream_kwargs))
 
     def _log_failure(exc: BaseException) -> None:
@@ -1307,6 +1368,19 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             attempt + 1, max_stream_retries + 1, model)
 
     def _drain_for_finalizer(event_stream: Any) -> None:
+        # A WebSocket has no per-response EOF: drain the managed wrapper once more so
+        # Relay's finalizer runs after the terminal event, while its underlying socket
+        # remains available for the next response.create on this agent.
+        if writer_token["websocket"]:
+            try:
+                for _ignored in event_stream:
+                    pass
+            except Exception:
+                logger.warning(
+                    "Codex WebSocket Relay finalization failed after terminal response; keeping the assembled response. %s",
+                    agent._client_log_context(), exc_info=True,
+                )
+            return
         # The final response is already assembled. Keep the finalizer drain on THIS owner thread:
         # moving the reader to a daemon thread and later closing from here releases the FD under that
         # thread's SSL BIO (#127390, same class as #29507). A tiny watchdog may only shutdown() the
@@ -1405,6 +1479,8 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         intercepted_events: list = []
         writer_token["value"] = writer_token["raw_stream"] = event_stream = None
         writer_token["superseded_logged"] = False
+        writer_token["websocket"] = False
+        writer_token["websocket_session"] = writer_token["websocket_plan"] = None
         try:
             try:
                 event_stream = relay_llm.stream(
@@ -1426,6 +1502,18 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     on_event=_fenced(_on_event), interrupt_check=_interrupt_or_superseded,
                 )
             except transport_errors as exc:
+                # A WebSocket response.create is already sent before its stream is
+                # returned here. If receiving then fails, acceptance by the server
+                # is ambiguous; do not retry through HTTP (or send another WSS
+                # request), which could start and bill the same inference twice.
+                if writer_token["websocket"]:
+                    _log_failure(exc)
+                    logger.warning(
+                        "Codex Responses WebSocket failed after request send; refusing a retry because the server "
+                        "may already be processing it. %s error=%s",
+                        agent._client_log_context(), exc,
+                    )
+                    raise
                 if attempt >= max_stream_retries:
                     _log_failure(exc)
                     raise
@@ -1448,6 +1536,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 # opened nothing is billed, so one fresh physical request is safe (#103673); once the writer
                 # token is claimed the inference may already be billed, so mid-stream failures still raise.
                 if (attempt < max_stream_retries and writer_token["value"] is None
+                        and not writer_token["websocket"]
                         and isinstance(exc.__cause__, _httpx.TransportError)):
                     logger.debug(
                         "Codex Responses pre-stream connect failed (attempt %s/%s); retrying. %s error=%s",
@@ -1463,6 +1552,8 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                                "(incomplete_details=%s, error=%s, streamed_chars=%d). %s",
                                final.status, final.incomplete_details, final.error,
                                sum(len(p) for p in agent._codex_streamed_text_parts), agent._client_log_context())
+            if writer_token["websocket_session"] is not None and writer_token["websocket_plan"] is not None:
+                writer_token["websocket_session"].commit(writer_token["websocket_plan"], final)
             return final
         finally:
             # relay_llm.stream is ManagedLlmStream, whose close() always owns the provider stream; only

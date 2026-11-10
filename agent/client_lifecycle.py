@@ -152,6 +152,14 @@ class ClientLifecycleMixin:
             self._client_lock = threading.RLock()
         return self._client_lock
 
+    def _close_codex_responses_websocket(self) -> None:
+        from agent.codex_responses_websocket import close_agent_session
+        close_agent_session(self)
+
+    def _abort_codex_responses_websocket_for_client(self, client: Any) -> None:
+        from agent.codex_responses_websocket import abort_agent_session_for_client
+        abort_agent_session_for_client(self, client)
+
     @staticmethod
     def _is_openai_client_closed(client: Any) -> bool:
         """Check if an OpenAI client is closed.
@@ -419,6 +427,13 @@ class ClientLifecycleMixin:
             cache = self._request_slot(slot_attr)
             if cache["client"] is client:
                 cache["poisoned"] = True
+        # The WebSocket transport is independent of httpx's socket pool. Abort its
+        # matching session too so a stale detector or user interrupt wakes recv().
+        if not anthropic:
+            try:
+                self._abort_codex_responses_websocket_for_client(client)
+            except Exception:
+                logger.debug("Codex Responses WebSocket abort failed (%s)", reason, exc_info=True)
         try:
             # Non-HTTP providers cancel without closing owner-thread file descriptors.
             if callable(getattr(type(client), "cancel", None)):

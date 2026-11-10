@@ -2,6 +2,7 @@
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 
@@ -294,7 +295,7 @@ class TestMaybePersistToolResult:
             threshold=30_000,
         )
         cmd = env.execute.call_args_list[1][0][0]
-        target = cmd.split("cat > ", 1)[1].split(" <<", 1)[0]
+        target = shlex.split(cmd.split("cat > ", 1)[1])[0]
 
         from tools.tool_result_storage import STORAGE_DIR
 
@@ -743,6 +744,33 @@ class TestMcpEnvelopeSpillover:
                   **json.loads(tail.removesuffix("\n</tool-result-metadata>\n"))}
         assert fields.pop("text_field") == "content"
         assert fields == {key: value for key, value in payload.items() if key != "content"}
+
+    def test_skill_view_uses_registered_spillover_limit(self):
+        from pathlib import Path
+        from tools.budget_config import budget_for_context_window
+
+        config_path = Path(os.environ["HERMES_HOME"]) / "config.yaml"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(
+            "tool_budget:\n  tool_overrides:\n    skill_view: 12000\n", encoding="utf-8")
+        config = budget_for_context_window(None)
+        limit = config.resolve_threshold("skill_view")
+        assert limit == 12_000
+
+        inline = "x" * limit
+        assert maybe_persist_tool_result(
+            content=inline, tool_name="skill_view", tool_use_id="tc_skill_at_limit", env=None, config=config
+        ) == inline
+
+        body = "# Large skill\n\n" + ("Use this instruction carefully.\n" * 1_000)
+        payload = json.dumps({"success": True, "name": "large-skill", "content": body})
+        result = maybe_persist_tool_result(
+            content=payload, tool_name="skill_view", tool_use_id="tc_skill_over_limit", env=None, config=config
+        )
+        assert PERSISTED_OUTPUT_TAG in result
+        assert "Use the read_file tool with offset and limit" in result
+        spill = (get_spillover_dir() / "tc_skill_over_limit.txt").read_text(encoding="utf-8")
+        assert body in spill
 
     def test_long_terminal_notes_stay_in_the_preview(self):
         note = ("Output exceeded the capture window (head+tail shown). Full output saved to "

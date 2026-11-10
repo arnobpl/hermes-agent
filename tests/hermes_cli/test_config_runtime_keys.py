@@ -1,4 +1,4 @@
-"""`hermes config get/set` must recognize keys the runtime reads but DEFAULT_CONFIG leaves unseeded:
+"""`hermes config get/set` must recognize schema-defined and runtime-only keys:
 core provider selections (``browser.cloud_provider``, ``<category>.use_gateway``), MoA preset fields
 (``moa.presets.<name>.fanout``), core-owned keys with a known reader (``computer_use.backend``), and keys
 an ACTIVE plugin declares through ``config_keys``.
@@ -60,8 +60,10 @@ def test_config_get_browser_selection_keys_print_value_without_notice(hermes_hom
     ("browser.cloud_provider", "browserbase"),   # core: tools.tool_backend_helpers.read_selection
     ("web.use_gateway", "true"),                 # core: legacy managed-gateway flag, every category
     ("dashboard.kanban.default_tenant", "t1"),   # core: bundled kanban dashboard preferences
+    ("tool_budget.mcp_result_size_chars", "32000"),  # core: tools.budget_config
+    ("tool_budget.tool_overrides.skill_view", "12000"),  # dynamic tool name under runtime-owned mapping
 ])
-def test_config_set_runtime_read_key_is_silent(key, value, hermes_home, capsys):
+def test_config_set_recognized_runtime_path_is_silent(key, value, hermes_home, capsys):
     assert not _set_notice(key, value, capsys)
 
 

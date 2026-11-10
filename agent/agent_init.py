@@ -1261,6 +1261,12 @@ def _apply_agent_section(agent, _agent_cfg):
     # "auto" (codex_responses only), true (all api_modes), false, or model substrings.
     agent._intent_ack_continuation = _agent_section.get("intent_ack_continuation", "auto")
 
+    # Experimental Responses WebSocket continuation is opt-in and is further gated to the official
+    # Codex backend in the streaming adapter.
+    agent._codex_responses_websocket_enabled = is_truthy_value(
+        _agent_section.get("codex_responses_websocket", False)
+    )
+
     # Responses `text.verbosity`: "" / unknown value = not sent (never flips the provider default).
     _verbosity = str(_agent_section.get("text_verbosity") or "").strip().lower()
     if _verbosity and _verbosity not in {"low", "medium", "high"}:

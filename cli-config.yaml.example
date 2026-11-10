@@ -778,9 +778,9 @@ compression:
 
   # Native OpenAI Responses server-side compaction (default: false). When true,
   # gpt-5.6-family models on the DIRECT OpenAI API (api.openai.com) or a ChatGPT
-  # Codex subscription, plus gpt-6-astra (and its -900k alias) on official Codex OAuth, compact
-  # server-side: OpenAI prunes older context into an
-  # encrypted checkpoint that Hermes replays on later turns. No other provider,
+  # Codex subscription, plus gpt-6-astra and gpt-6-luna (and their -900k aliases)
+  # on official Codex OAuth, compact server-side: OpenAI prunes older context into an encrypted
+  # checkpoint that Hermes replays on later turns. No other provider,
   # route, or model is affected. Hermes' local compression stays armed as the
   # fallback and still handles every non-eligible session.
   codex_responses_native: false
@@ -871,6 +871,8 @@ compression:
 #
 # tool_budget:
 #   mcp_result_size_chars: 50000   # per-result spillover threshold for mcp_* tools
+#   tool_overrides:
+#     skill_view: 12000             # spill long skill content before it expands future context
 
 # =============================================================================
 # Anthropic prompt caching TTL
@@ -1319,6 +1321,14 @@ agent:
   # primaries (default 3). The OpenAI SDK does its own low-level retries
   # underneath this wrapper — this is the Hermes-level loop.
   # api_max_retries: 3
+
+  # Experimental: keep an official Codex Responses WebSocket open within one agent lifetime.
+  # Follow-up calls send only new input when Hermes' replayed history exactly extends the prior
+  # request plus its completed output; other request changes send full input. If connection-level
+  # headers/query change, Hermes falls back to HTTP. Volatile connection state only.
+  # Default false; this can reduce repeated client/payload work on multi-call tool turns, but does
+  # not reduce billed input tokens.
+  # codex_responses_websocket: false
 
   # Once api_max_retries AND the fallback chain are spent on a transient outage
   # (5xx, overloaded/529, connect/read timeouts) and nothing has been delivered

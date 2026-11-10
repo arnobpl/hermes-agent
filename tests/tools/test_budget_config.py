@@ -7,9 +7,11 @@ and the PINNED_THRESHOLDS escape-hatch for read_file.
 
 from unittest.mock import patch
 
+import pytest
 
 from tools.budget_config import (
     DEFAULT_BUDGET,
+    DEFAULT_MCP_RESULT_SIZE_CHARS,
     DEFAULT_RESULT_SIZE_CHARS,
     PINNED_THRESHOLDS,
     BudgetConfig,
@@ -67,6 +69,10 @@ class TestResolveThreshold:
         result = cfg.resolve_threshold("my_tool")
         assert result == 42
 
+    def test_tool_override_is_capped_by_scaled_default(self):
+        cfg = BudgetConfig(default_result_size=20_000, tool_overrides={"skill_view": 50_000})
+        assert cfg.resolve_threshold("skill_view") == 20_000
+
 
     @patch("tools.registry.registry")
     def test_registry_value_capped_at_default(self, mock_registry):
@@ -102,6 +108,37 @@ class TestBudgetForContextWindow:
     def test_zero_or_negative_returns_default(self):
         assert budget_for_context_window(0) is DEFAULT_BUDGET
         assert budget_for_context_window(-5) is DEFAULT_BUDGET
+
+    def test_tool_overrides_load_without_context_length(self, tmp_path, monkeypatch):
+        (tmp_path / "config.yaml").write_text(
+            "tool_budget:\n  tool_overrides:\n    skill_view: 12000\n", encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        cfg = budget_for_context_window(None)
+        assert cfg.resolve_threshold("skill_view") == 12_000
+
+    def test_tool_overrides_survive_context_scaling_and_are_capped(self, tmp_path, monkeypatch):
+        (tmp_path / "config.yaml").write_text(
+            "tool_budget:\n  tool_overrides:\n    skill_view: 12000\n", encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        cfg = budget_for_context_window(16_384)
+        assert cfg.default_result_size < 12_000
+        assert cfg.resolve_threshold("skill_view") == cfg.default_result_size
+
+    def test_invalid_tool_override_entries_are_ignored(self, tmp_path, monkeypatch):
+        (tmp_path / "config.yaml").write_text(
+            "tool_budget:\n  tool_overrides:\n    skill_view: true\n    search_files: 12.5\n",
+            encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        cfg = budget_for_context_window(None)
+        assert cfg.tool_overrides == {}
+        assert cfg.resolve_threshold("skill_view") == DEFAULT_RESULT_SIZE_CHARS
+
+    @pytest.mark.parametrize("value", ["true", "12.5", "invalid"])
+    def test_invalid_mcp_result_threshold_uses_default(self, value, tmp_path, monkeypatch):
+        (tmp_path / "config.yaml").write_text(
+            f"tool_budget:\n  mcp_result_size_chars: {value}\n", encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        assert budget_for_context_window(None).mcp_result_size == DEFAULT_MCP_RESULT_SIZE_CHARS
 
 
     def test_scaled_budget_constrains_oversized_result(self):
@@ -153,6 +190,13 @@ class TestMcpPrefixThreshold:
         assert cfg.resolve_threshold("mcp_composio_multi_execute") == 30_000
         # Generic tools are untouched by the MCP knob.
         assert cfg.default_result_size == DEFAULT_RESULT_SIZE_CHARS
+
+    def test_quoted_config_override_via_hermes_home(self, tmp_path, monkeypatch):
+        (tmp_path / "config.yaml").write_text(
+            'tool_budget:\n  mcp_result_size_chars: "30000"\n', encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        cfg = budget_for_context_window(None)
+        assert cfg.mcp_result_size == 30_000
 
     def test_config_override_survives_window_scaling(self, tmp_path, monkeypatch):
         (tmp_path / "config.yaml").write_text(

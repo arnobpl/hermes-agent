@@ -1,5 +1,5 @@
 """Configurable budget constants for tool result persistence.
-Per-tool resolution: pinned > config overrides > registry > default."""
+Per-tool resolution: pinned > config overrides > MCP prefix > registry > default."""
 
 from dataclasses import dataclass, field
 from typing import Dict
@@ -35,11 +35,38 @@ def _configured_mcp_result_size() -> int:
         data = load_config_readonly()
         block = data.get("tool_budget") if isinstance(data, dict) else None
         raw = block.get("mcp_result_size_chars") if isinstance(block, dict) else None
-        if raw is not None and int(raw) > 0:
-            return int(raw)
+        if isinstance(raw, str):
+            try:
+                raw = int(raw)
+            except ValueError:
+                raw = None
+        if isinstance(raw, int) and not isinstance(raw, bool) and raw > 0:
+            return raw
     except Exception:
         pass
     return DEFAULT_MCP_RESULT_SIZE_CHARS
+
+
+def _configured_tool_overrides() -> dict[str, int]:
+    """Read positive integer per-tool thresholds from ``tool_budget.tool_overrides``.
+
+    Invalid entries are ignored independently. In particular, booleans and fractional values are
+    not accepted as character counts. Raw config access stays behind ``load_config_readonly``.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        data = load_config_readonly()
+        block = data.get("tool_budget") if isinstance(data, dict) else None
+        raw_overrides = block.get("tool_overrides") if isinstance(block, dict) else None
+        if not isinstance(raw_overrides, dict):
+            return {}
+        return {
+            name: value for name, value in raw_overrides.items()
+            if isinstance(name, str) and name and isinstance(value, int)
+            and not isinstance(value, bool) and value > 0
+        }
+    except Exception:
+        return {}
 
 
 @dataclass(frozen=True)
@@ -65,7 +92,7 @@ class BudgetConfig:
         if tool_name in PINNED_THRESHOLDS:
             return PINNED_THRESHOLDS[tool_name]
         if tool_name in self.tool_overrides:
-            return self.tool_overrides[tool_name]
+            return min(self.tool_overrides[tool_name], self.default_result_size)
         if tool_name.startswith(MCP_TOOL_PREFIX):
             return min(self.mcp_result_size, self.default_result_size)
         from tools.registry import registry
@@ -101,14 +128,16 @@ def budget_for_context_window(context_length: int | None) -> BudgetConfig:
     oversized request (#23767).
     """
     mcp_result_size = _configured_mcp_result_size()
+    tool_overrides = _configured_tool_overrides()
     if not context_length or context_length <= 0:
-        if mcp_result_size == DEFAULT_MCP_RESULT_SIZE_CHARS:
+        if mcp_result_size == DEFAULT_MCP_RESULT_SIZE_CHARS and not tool_overrides:
             return DEFAULT_BUDGET
-        return BudgetConfig(mcp_result_size=mcp_result_size)
+        return BudgetConfig(mcp_result_size=mcp_result_size, tool_overrides=tool_overrides)
     window_chars = context_length * _CHARS_PER_TOKEN
     return BudgetConfig(
         default_result_size=max(_MIN_RESULT_SIZE_CHARS, min(int(window_chars * _PER_RESULT_WINDOW_FRACTION), DEFAULT_RESULT_SIZE_CHARS)),
         turn_budget=max(_MIN_TURN_BUDGET_CHARS, min(int(window_chars * _PER_TURN_WINDOW_FRACTION), DEFAULT_TURN_BUDGET_CHARS)),
         preview_size=DEFAULT_PREVIEW_SIZE_CHARS,
         mcp_result_size=mcp_result_size,
+        tool_overrides=tool_overrides,
     )

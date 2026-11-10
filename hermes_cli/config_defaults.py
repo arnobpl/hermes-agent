@@ -130,6 +130,11 @@ DEFAULT_CONFIG = {
         # otherwise wedge the turn until the idle watchdog discards the already-billed response
         # (#103864). 0 skips the drain. Well-behaved endpoints close immediately and never wait this long.
         "stream_drain_timeout": 2.0,
+        # Experimental, opt-in WebSocket Responses transport for the official Codex OAuth route.
+        # Reuses connection-local response state only when the next input strictly extends the last
+        # request and completed output; otherwise sends the full input. Changed connection headers
+        # or query parameters retire the socket. Never persisted.
+        "codex_responses_websocket": False,
         # Empty-response retry guard. Empty retries re-send the full input at full price; this stops
         # re-billing deterministic empties (unsignaled refusals, zero output tokens) while failing
         # open on ambiguous evidence (missing usage, any tokens, model/provider change).
@@ -2010,6 +2015,12 @@ DEFAULT_CONFIG = {
         # The flag is the user's off switch; availability additionally requires
         # the portal sign-in every managed tool gates on.
         "connectors": {"enabled": True},
+    },
+    # Tool-result spillover thresholds. Empty tool_overrides means use registry/default thresholds;
+    # tool names under this mapping are user-defined and may be added with `hermes config set`.
+    "tool_budget": {
+        "mcp_result_size_chars": None,
+        "tool_overrides": {},
     },
     "logging": {  # File logging to ~/.hermes/logs/: agent.log captures INFO+, errors.log WARNING+.
         "level": "INFO",       # minimum level for agent.log: DEBUG, INFO, WARNING

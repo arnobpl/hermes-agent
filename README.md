@@ -3,6 +3,7 @@
 </p>
 
 # Hermes Agent ☤
+
 <p align="center">
   <a href="https://hermes-agent.nousresearch.com/">Hermes Agent</a> | <a href="https://hermes-agent.nousresearch.com/">Hermes Desktop</a>
 </p>
@@ -29,6 +30,37 @@ Use any model you want — [Nous Portal](https://portal.nousresearch.com), OpenR
 <tr><td><b>Runs anywhere, not just your laptop</b></td><td>Six built-in terminal backends — local, Docker, SSH, Modal, Daytona, and Vercel Sandbox — plus plugin backends such as Singularity/Apptainer. Daytona and Modal offer serverless persistence — your agent's environment hibernates when idle and wakes on demand, costing nearly nothing between sessions. Run it on a $5 VPS or a GPU cluster.</td></tr>
 <tr><td><b>Research-ready</b></td><td>Batch trajectory generation, trajectory compression for training the next generation of tool-calling models.</td></tr>
 </table>
+
+## Fork addition
+
+This fork enables native server-side Responses compaction for `gpt-6-luna` on the official
+ChatGPT Codex OAuth route, verified with a live disposable request. The `-900k` picker alias
+also works because Hermes sends the same wire model. It remains opt-in with
+`compression.codex_responses_native: true`; other Luna routes and provider-prefixed IDs stay disabled.
+See the [context compression guide](website/docs/developer-guide/context-compression-and-caching.md#native-responses-compaction-gpt-56-astra-and-luna-on-supported-routes) for details.
+
+Set `tool_budget.tool_overrides.skill_view: 12000` to spill large `skill_view` results into Hermes'
+existing pageable tool-result store. The threshold is configurable and capped by the active model's
+context budget. The model receives a preview; when spillover succeeds, full output remains
+available through Hermes' normal paged-result recovery tools. Direct `skill_view()` reads still
+return the full skill document.
+
+The fork also includes an experimental opt-in WebSocket continuation for the official Codex OAuth
+Responses route. Set `agent.codex_responses_websocket: true` to keep a connection for the active
+agent and send only new input on a tool-loop follow-up when replayed history matches the prior
+request and completed output. Function-call argument objects are compared independent of whitespace
+and key order; floating-point and negative-zero number tokens stay exact. A replayed reasoning item
+may omit `content` only when it is an empty list; populated reasoning content remains part of the
+comparison. A replay mismatch sends the full input over the existing WebSocket. A failed handshake or
+changes to request-level headers or query parameters make Hermes use HTTP. Hermes does not retry a
+failed WebSocket send over HTTP because the server may already have accepted it. The connection and
+response state are volatile and do not reduce billed input tokens. The setting remains `false` by
+default. Isolated VM runs confirmed incremental follow-ups and smaller request payloads, but have not
+demonstrated a reliable end-to-end latency improvement over HTTP.
+
+In the Desktop/browser composer, set `desktop.enter_to_send: false` (or turn off
+**Settings → Chat → Send on Enter**) to make Enter insert a newline; use the Send
+button to submit.
 
 ---
 
@@ -96,6 +128,7 @@ Expand-Archive $zip "$env:TEMP\uv_x" -Force
 If attestation says "Verification succeeded" and the last line prints `True`, you're good.
 
 **To whitelist Hermes:**
+
 - **Windows Defender:** Run PowerShell as Admin → `Add-MpPreference -ExclusionPath "$env:LOCALAPPDATA\hermes\bin"`
 - **Bitdefender:** Add an exception in the Bitdefender console (Protection > Antivirus > Settings > Manage Exceptions)
 - Whitelist the **folder**, not the file hash — Hermes updates `uv` and the hash changes every version

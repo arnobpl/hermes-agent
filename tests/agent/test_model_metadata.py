@@ -790,6 +790,7 @@ class TestCodexOAuthContextLength:
     # (model_id, is_valid_variant, expected_ctx, expected_wire_model)
     _900K_TABLE = [
         ("gpt-5.6-sol-900k",              True,  900_000, "gpt-5.6-sol"),
+        ("gpt-6-luna-900k",               True,  900_000, "gpt-6-luna"),
         # dated snapshot of a routable 5.6 base
         ("gpt-5.6-sol-2026-07-09-900k",   True,  900_000, "gpt-5.6-sol-2026-07-09"),
         # vendor-namespaced variant (display/aux callers) resolves too

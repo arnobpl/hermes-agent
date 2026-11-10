@@ -1001,9 +1001,13 @@ MCP tool results (tools named `mcp_*`) spill at a tighter **50,000-char** defaul
 ```yaml
 tool_budget:
   mcp_result_size_chars: 50000   # per-result spillover threshold for mcp_* tools
+  tool_overrides:
+    skill_view: 12000             # per-result spillover threshold for skill_view
 ```
 
-The MCP threshold is always capped at the (possibly context-scaled) generic per-result threshold, so raising it cannot exceed what the active model's window allows.
+`tool_overrides` maps tool names to positive integer spillover thresholds. The override is capped at the (possibly context-scaled) generic per-result threshold, so it cannot exceed what the active model's window allows. For example, setting `skill_view` to `12000` replaces oversized skill content with the standard preview and spillover path; the direct skill loader remains unchanged.
+
+The MCP threshold is also capped at the context-scaled generic per-result threshold.
 
 Hermes also flags **provider-side elision**: when an MCP or web tool result embeds its own truncation markers (`...N more items`, `"has_more": true`, "saved to sandbox" notes), a one-line notice is appended to the result warning that the visible data is incomplete and should be paged/fetched before treating any enumeration as complete.
 
@@ -1343,6 +1347,7 @@ agent:
                                # "unlimited"/"inf"/"infinity"/"infinite"/0/-1 = no limit
   budget_warning_ratio: null   # Optional one-time checkpoint warning, e.g. 0.75
   api_max_retries: 3           # Retries per provider before fallback engages (default: 3)
+  codex_responses_websocket: false # Experimental official Codex-only persistent Responses connection
   auto_recovery_cycles: 5      # Wait-and-retry cycles after retries + fallback are spent on an outage (0 = off)
 ```
 
@@ -1351,6 +1356,8 @@ agent:
 `agent.budget_warning_ratio` is off by default for ordinary and delegated conversations. When set to a value strictly between `0` and `1` alongside a finite `max_turns`, Hermes appends one model-visible checkpoint notice to the latest tool result after the threshold is reached. The notice rearms each conversation turn and uses each agent's own iteration budget. It only appends to a current tool-result tail, never an older turn, and does not add a synthetic user/system message or change the existing exhaustion grace call. Dispatcher-owned Kanban workers receive a completion checkpoint at 90% by default (an explicit ratio changes that threshold), while their tools are still available. The checkpoint asks for verified completion or a durable progress comment, not premature success.
 
 `agent.api_max_retries` controls how many times Hermes retries a provider API call on transient errors (rate limits, connection drops, 5xx) **before** fallback-provider switching engages. The default is `3` — four attempts total. If you have [fallback providers](./features/fallback-providers.md) configured and want to fail over faster, drop this to `0` so the first transient error on your primary immediately hands off to the fallback instead of churning retries against the flaky endpoint.
+
+`agent.codex_responses_websocket` is an experimental opt-in for the official Codex OAuth Responses route. Hermes keeps a WebSocket only for the active agent, and sends a follow-up input delta only when the serialized history still has the previous request and completed response output as an exact prefix. A history or model-parameter mismatch sends the full input on the current connection. If request-level headers or query parameters change during the connection, Hermes closes it and falls back to HTTP. A failed handshake also falls back to HTTP, while an ambiguous send failure is surfaced without retrying to avoid duplicating a request that the server may have accepted. The response ID and connection stay in memory and are discarded when the agent closes. This can reduce repeated input transfer and client work on multi-call turns, but it does not reduce billed input tokens. Leave it `false` unless you are testing the experimental transport.
 
 A rate limit that names its reset (`Retry-After` or a `retry_after` body field) is waited out, capped at 600 s per retry. The live status line shows the wait and, when the provider names it, when the limit resets. One exception: on the free Nous tier (no sign-in), a session someone is watching (the Desktop app, the TUI, the `hermes` terminal chat, an ACP editor) does not sit through a cooldown longer than 60 s, because the free tier's pause covers the whole service and a retry before the reset only meets the same refusal. The turn ends at once and says when the limit lifts; a configured fallback runs first. Unattended runs (`hermes chat -q`, cron, messaging platforms, delegated subagents) keep waiting.
 
