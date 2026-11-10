@@ -258,12 +258,17 @@ _SYNC_FALLBACK_NOTES = {
         "background=true is not available in this session — it cannot "
         "receive a detached subagent result after the turn ends (a "
         "finite chat using -Q, --oneshot, or non-TTY stdio, `hermes -z`, a /bg background task, a cron "
-        "job, a Kanban worker, or a stateless HTTP endpoint). The subagent(s) ran SYNCHRONOUSLY and the result is included above."
+        "job, a Kanban worker, or a stateless HTTP endpoint without declared server-history delivery). "
+        "The subagent(s) ran SYNCHRONOUSLY and the result is included above."
     ),
     "at_capacity": (
         "The background delegation pool was at capacity (delegation.max_concurrent_children), so the subagent(s) ran "
         "SYNCHRONOUSLY and the result is included above. Raise "
         "delegation.max_concurrent_children in config.yaml to allow more concurrent background delegations."
+    ),
+    "schedule_failed": (
+        "The background dispatcher could not schedule the subagent(s), so they ran SYNCHRONOUSLY and the result is "
+        "included above."
     ),
 }
 
@@ -277,7 +282,7 @@ def _run_sync_with_note(batch: _Batch, reason: str) -> str:
 def _resolve_async_wake_sid(
     origin_wake_sid: str, origin_session_history_delivery: bool = False, oneshot_session: bool = False,
 ) -> Optional[str]:
-    """Detached result target: empty for push, a resumable API id, or None for inline.
+    """Detached result target: empty for push, a persist-only API id, or None for inline.
 
     API completion only persists a row; this does not authorize a model wake. The
     continuation must read that row, not an authoritative caller-owned snapshot.
@@ -305,7 +310,7 @@ def _resolve_async_wake_sid(
     if origin_wake_sid and origin_session_history_delivery:
         logger.info(
             "delegate_task: session %s resumes server history — detached result will be persisted "
-            "for the next client turn (no model wake).", origin_wake_sid,
+            "for a later client turn after delivery (no model wake).", origin_wake_sid,
         )
         return origin_wake_sid
     if origin_wake_sid:
@@ -364,13 +369,33 @@ _BACKGROUND_NOTES = {
     "one": (
         "Subagent is running in the background; its full result re-enters the conversation as a new message when it "
         "finishes. Results are delivered only after you END YOUR TURN: do anything that does not depend on it, then "
-        "stop with a one-line status. Do not poll its transcript or artifacts to wait for it."
+        "stop with a one-line status. If a CLI/TUI completion reaches the head of the queue while no viewer is attached, Hermes saves it "
+        "as a note for the next turn instead of starting a turn. Do not poll its transcript or artifacts to wait for it."
     ),
     "many": (
         "{n} subagents are running in parallel in the background as {k} completion unit(s); each unit's results "
         "re-enter the conversation as their own new message when THAT unit finishes. Results are delivered only "
-        "after you END YOUR TURN: do anything that does not depend on them, then stop with a one-line status. Do not "
-        "poll transcripts or artifacts to wait for them."
+        "after you END YOUR TURN: do anything that does not depend on them, then stop with a one-line status. If a "
+        "CLI/TUI completion reaches the head of the queue while no viewer is attached, Hermes saves it as a note for the next "
+        "turn instead of starting a turn. Do not poll transcripts or artifacts to wait for them."
+    ),
+    # Persist-only surfaces (stateless api_server sessions with a declared server-history consumer):
+    # the completion is appended to the session transcript WITHOUT a model wake, so it reaches the
+    # model only on a later client turn (#85957, #135818). The note must say so — the "one"/"many"
+    # wording would have the model promise an unprompted follow-up that never comes.
+    "one_persist": (
+        "Subagent is running in the background; its result is saved to this session's transcript when delivery "
+        "completes. The assistant can use it on a subsequent client turn after it is stored; completion does not start "
+        "a turn. Do anything that does not depend on it, then stop with a one-line status telling the user the result "
+        "will be saved to the transcript and can be picked up on a later message. Do not promise an unprompted "
+        "follow-up, and do not poll its transcript or artifacts to wait for it."
+    ),
+    "many_persist": (
+        "{n} subagents are running in parallel in the background as {k} completion unit(s); each unit's results are "
+        "saved to this session's transcript when delivered and can be used by the assistant on a later client turn. "
+        "Completions do not start turns. Do anything that does not depend on them, then stop with a one-line status "
+        "telling the user results will be saved to the transcript and can be picked up on a later message. Do not "
+        "promise an unprompted follow-up, and do not poll transcripts or artifacts to wait for them."
     ),
     "control_hint": (
         "While a child runs you can orchestrate it live with this same tool: delegate_task(action='list') to see live "
@@ -383,21 +408,35 @@ _BACKGROUND_NOTES = {
     ),
 }
 
-def _dispatched_payload(batch: _Batch, units: list[tuple[_Batch, str]]) -> dict:
-    """Model-facing handle for an accepted background call: one entry per async unit."""
+def _dispatched_payload(batch: _Batch, units: list[tuple[_Batch, str]], persist_only: bool = False) -> dict:
+    """Model-facing handle for an accepted background call: one entry per async unit.
+
+    ``persist_only``: the originating session receives detached completions as transcript rows
+    without a model wake (``_resolve_async_wake_sid`` returned a non-empty id), so the note must
+    say that a later client turn can use the result instead of promising an automatic follow-up."""
     goals = [t["goal"] for t in batch.task_list]
-    n = len(batch.children)  # running children; refused tasks are listed under "refused"
+    dispatched_children = [child for unit, _unit_id in units for child in unit.children]
+    # Partial dispatch failures run the remaining units inline.
+    n = len(dispatched_children)
+    note_key = (
+        ("one_persist" if n == 1 else "many_persist")
+        if persist_only
+        else ("one" if n == 1 else "many")
+    )
+    note = _BACKGROUND_NOTES[note_key]
+    if n > 1:
+        note = note.format(n=n, k=len(units))
     payload = {
         "status": "dispatched", "mode": "background", "count": n,
         "delegation_id": batch.live_deleg_id or units[0][1], "goals": goals,
-        "note": _BACKGROUND_NOTES["one"] if n == 1 else _BACKGROUND_NOTES["many"].format(n=n, k=len(units)),
+        "note": note,
     }
     if len(units) > 1:
         payload["units"] = [
             {"delegation_id": uid, "group": unit.group, "task_indexes": [i for (i, _, _) in unit.children]}
             for unit, uid in units
         ]
-    sids = [getattr(c, "_subagent_id", None) for (_, _, c) in batch.children]
+    sids = [getattr(c, "_subagent_id", None) for (_, _, c) in dispatched_children]
     if any(isinstance(s, str) and s for s in sids):
         payload["subagent_ids"] = sids
         payload["control_hint"] = _BACKGROUND_NOTES["control_hint"]
@@ -411,10 +450,12 @@ def _dispatched_payload(batch: _Batch, units: list[tuple[_Batch, str]]) -> dict:
 def _units_of(batch: _Batch) -> list[_Batch]:
     """Partition the call's children into async units: one per distinct task ``group`` (first-appearance order) and
     one per ungrouped task. Each unit is a ``_Batch`` sharing the call's task_list/transcripts but owning a subset of
-    ``children``, so a unit joins only on itself and its completion re-enters the conversation on its own.
+    ``children``, so it joins only on itself and emits one completion. Push-capable sessions wake the parent with it;
+    persist-only API sessions store it for a later client turn without waking a model.
 
-    Off by default (``delegation.independent_completions``): the whole call is ONE unit and returns as one message.
-    A per-task flurry of completions (one new turn each) fragmented orchestrators that had no plan for it."""
+    Off by default (``delegation.independent_completions``): the whole call is ONE unit.
+    A per-task flurry of completions (one new turn each on push-capable sessions) fragmented orchestrators that had no
+    plan for it."""
     from tools.delegate_tool_config import _get_independent_completions
     if not _get_independent_completions():
         return [batch]
@@ -457,11 +498,44 @@ def _restore_parent_cancellation(unit: _Batch) -> None:
     for _, _, child in unit.children:
         _attach_child(unit.parent_agent, child)
 
+
+_DISPATCH_REFUSAL_MESSAGES = {
+    "session_closed": "The owning session closed before this unit was accepted; it was not started.",
+    "backend_retiring": "The backend is retiring and refused this unit; it was not started.",
+    "unknown": "The background dispatcher refused this unit; it was not started.",
+}
+
+
+def _settle_unstarted_unit(unit: _Batch, reason: str, *, completed: bool) -> list[dict]:
+    """Close children rejected before admission and record an explicit result without running them."""
+    message = _DISPATCH_REFUSAL_MESSAGES.get(reason, _DISPATCH_REFUSAL_MESSAGES["unknown"])
+    status = "interrupted" if reason == "session_closed" else "error"
+    results = []
+    for index, _task, child in unit.children:
+        _release_unstarted_child(unit, child)
+        entry = _fabricated_entry(index, status, message, child)
+        if status == "interrupted":
+            entry["exit_reason"] = "interrupted"
+        results.append(entry)
+
+    _finalize_child_results(results, unit.task_list, unit.children, unit.parent_agent)
+    for entry in results:
+        index = entry["task_index"]
+        writer = unit.live_writers[index] if index < len(unit.live_writers) else None
+        if writer is not None:
+            with _quiet("Live transcript finalize failed", exc_info=True):
+                writer.finalize(entry)
+    from tools.delegation_live_log import update_manifest_statuses
+    update_manifest_statuses(unit.live_deleg_id, results, home=unit.live_home, completed=completed)
+    finish_delegation_unit(unit.task_list, results, background=True)
+    return results
+
 def _dispatch_background(batch: _Batch) -> str:
     """Dispatch the call as independent async units (see ``_units_of``) and return the tool result JSON. Every unit
     of one call shares ONE pool slot (``slot_key``), so grouping never changes capacity accounting. Falls back to
     running synchronously (with an explanatory ``note``) when the session cannot receive detached completions or the
-    async pool is at capacity."""
+    async pool is at capacity / scheduling fails. Rejections caused by a closed session or retiring backend are
+    recorded without starting the unaccepted children."""
     from tools.delegate_tool import _get_max_async_children
     wake_sid = _resolve_async_wake_sid(
         batch.origin_wake_sid, batch.origin_session_history_delivery,
@@ -470,6 +544,10 @@ def _dispatch_background(batch: _Batch) -> str:
     if wake_sid is None:
         logger.info("delegate_task: async delivery unsupported on this session runtime; running the batch synchronously instead.")
         return _run_sync_with_note(batch, "no_async")
+    # Non-empty wake_sid = the origin session declared a server-history consumer but cannot be
+    # woken (stateless api_server): completions persist as transcript rows, so the dispatch note
+    # must say that a later turn can use the result, not promise a self-driven new one (#135818).
+    persist_only = bool(wake_sid)
 
     parent_agent = batch.parent_agent
     session_key, origin_ui_session_id = _resolve_async_session_key(parent_agent, batch.origin_ui_session_id)
@@ -481,6 +559,7 @@ def _dispatch_background(batch: _Batch) -> str:
     units = [replace(unit, refused=[]) for unit in _units_of(batch)]
     dispatched: list[tuple[_Batch, str]] = []
     inline_results: list[dict] = []
+    not_dispatched: list[dict] = []
     slot_key: Optional[str] = None
     for k, unit in enumerate(units):
         # One unit keeps the live-transcript directory's id so the returned delegation_id matches
@@ -496,20 +575,42 @@ def _dispatch_background(batch: _Batch) -> str:
             slot_key = slot_key or dispatch["delegation_id"]
             dispatched.append((unit, dispatch["delegation_id"]))
             continue
-        _restore_parent_cancellation(unit)
-        if not dispatched:
+        reason = dispatch.get("reason")
+        if reason in {"at_capacity", "schedule_failed"}:
+            _restore_parent_cancellation(unit)
+        if not dispatched and reason in {"at_capacity", "schedule_failed"}:
             logger.info(
-                "delegate_task: async pool at capacity (%s); running the whole batch synchronously instead.",
+                "delegate_task: async dispatch refused (%s); running the whole batch synchronously instead.",
                 dispatch.get("error", "rejected"),
             )
-            return _run_sync_with_note(batch, "at_capacity")
-        # Later units of an admitted call share its slot and cannot be capacity-rejected; a scheduler failure runs
-        # the unit inline so no task is silently dropped.
-        logger.warning("delegate_task: unit %d/%d not accepted (%s); running it inline.", k + 1, len(units), dispatch.get("error"))
-        inline_results.extend(_execute_and_aggregate(unit)["results"])
-    payload = _dispatched_payload(batch, dispatched)
+            return _run_sync_with_note(batch, reason)
+        if reason in {"at_capacity", "schedule_failed"}:
+            # A later unit may lose its shared slot if an earlier one finishes before admission; run it inline.
+            logger.warning("delegate_task: unit %d/%d not accepted (%s); running it inline.", k + 1, len(units), dispatch.get("error"))
+            inline_results.extend(_execute_and_aggregate(unit)["results"])
+            continue
+        refusal_reason = reason if reason in _DISPATCH_REFUSAL_MESSAGES else "unknown"
+        not_dispatched.extend(_settle_unstarted_unit(
+            unit, refusal_reason, completed=(not dispatched and k == len(units) - 1),
+        ))
+        for pending_index, pending_unit in enumerate(units[k + 1:], start=k + 1):
+            not_dispatched.extend(_settle_unstarted_unit(
+                pending_unit, refusal_reason,
+                completed=(not dispatched and pending_index == len(units) - 1),
+            ))
+        if not dispatched:
+            from tools.registry import tool_error
+            results = [*batch.refused, *not_dispatched]
+            results.sort(key=lambda entry: entry.get("task_index", -1))
+            return tool_error(_DISPATCH_REFUSAL_MESSAGES.get(refusal_reason, _DISPATCH_REFUSAL_MESSAGES["unknown"]),
+                              results=results)
+        break
+    payload = _dispatched_payload(batch, dispatched, persist_only=persist_only)
     if inline_results:
         payload["inline_results"] = inline_results
+    if not_dispatched:
+        not_dispatched.sort(key=lambda entry: entry.get("task_index", -1))
+        payload["not_dispatched"] = not_dispatched
     return json.dumps(payload, ensure_ascii=False)
 
 def _run_batch(batch: _Batch, background: bool) -> str:

@@ -24,7 +24,9 @@ def test_async_delegations_hold_busy_accounting_through_finalization(tmp_path, m
 
     token = fence.prepare()["token"]
     try:
-        assert dispatch()["status"] == "rejected"
+        rejected = dispatch()
+        assert rejected["status"] == "rejected"
+        assert rejected["reason"] == "backend_retiring"
         assert not entered.is_set()
         assert fence.cancel(token) == {"ok": True}
         handle = dispatch()

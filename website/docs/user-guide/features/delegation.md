@@ -8,7 +8,7 @@ description: "Spawn isolated child agents for parallel workstreams with delegate
 
 The `delegate_task` tool spawns child AIAgent instances with isolated context, inherited tool access, and their own terminal sessions. Each child gets a fresh conversation and works independently — only its final summary enters the parent's context.
 
-Top-level model calls run in the background automatically. Hermes returns a handle immediately so the conversation can continue, then posts the result back as a new message. An orchestrator subagent waits for its own workers so it can synthesize their results before returning.
+Top-level model calls can run in the background. On wake-capable surfaces, Hermes returns a handle immediately so the conversation can continue, then delivers completed results as new messages. In CLI/TUI sessions, if a completion reaches the head of the queue while no viewer is attached, Hermes saves it as a note for the next turn instead of starting a turn. Persist-only API-server sessions store results in session history without waking the model; a later client turn after delivery can use them. An orchestrator subagent waits for its own workers so it can synthesize their results before returning.
 
 ## Completion delivery
 
@@ -23,6 +23,8 @@ age limit; actual transport failures retain their bounded retry policy.
 An unavailable API-server route stays pending without repeated missing-route warnings.
 Malformed messaging routes still produce diagnostics. On the API server, an async delegation
 completion adds a durable timeline delivery row only: the client owns the next model turn.
+For CLI/TUI, a completion that reaches the head of the queue while no viewer is attached is saved as
+a note for the next turn instead of starting a turn.
 Setting background process notifications to `off` still drains pattern-watch events silently.
 
 ## Background process lifetime
@@ -183,19 +185,19 @@ delegate_task(
 
 ## Batch Mode Details
 
-When a top-level agent provides a `tasks` array, Hermes returns one background handle and runs the subagents in parallel. By default the call returns **one** consolidated message once every task has finished. Results are delivered only between the parent's turns: the parent should finish anything that does not depend on the children, then end its turn rather than polling transcripts, artifacts, or CI while it waits.
+When a top-level agent provides a `tasks` array, Hermes returns one background handle and runs the subagents in parallel. By default the call produces **one** consolidated completion after every task has finished. Wake-capable surfaces deliver it between the parent's turns; if a CLI/TUI completion reaches the head of the queue while no viewer is attached, Hermes saves it as a note for the next turn. Persist-only API-server sessions save it in history for a later client turn after delivery, without starting another model turn. The parent should finish anything that does not depend on the children, then end its turn rather than polling transcripts, artifacts, or CI while it waits.
 
 ### Independent completions (opt-in)
 
-Set `delegation.independent_completions: true` to have results land **per completion unit** as each finishes instead. The model-facing `group` field and grouping guidance are only advertised when this option is enabled. Start a new session after changing it so the tool schema can reflect the setting without changing an existing conversation's cached prefix. Old calls containing `group` remain accepted; with the option off, the whole call still returns together.
+Set `delegation.independent_completions: true` to deliver results **per completion unit** as each finishes. Wake-capable sessions deliver each unit through a separate completion message; persist-only API sessions save each unit to history after delivery without waking the model. The model-facing `group` field and grouping guidance are only advertised when this option is enabled. Start a new session after changing it so the tool schema can reflect the setting without changing an existing conversation's cached prefix. Old calls containing `group` remain accepted; with the option off, the whole call still returns together.
 
 When independent completions are enabled:
 
-- Omit `group` when each result is useful to act on separately. Each task reports as soon as it finishes.
-- Use the same `group` string when you want to review outputs together: comparison, synthesis, or one coordinated decision. The group returns **one** consolidated message after all its tasks finish. Even independently executable tasks can belong in one group when their results inform the same decision.
-- Different groups report independently; grouped and ungrouped tasks can share one call.
+- Omit `group` when each result is useful to act on separately. On wake-capable sessions, each task is delivered as soon as its completion unit finishes.
+- Use the same `group` string when you want to review outputs together: comparison, synthesis, or one coordinated decision. On wake-capable sessions, the group returns **one** consolidated message after all its tasks finish. Persist-only API sessions save that completion as one history row after delivery, without waking the model. Even independently executable tasks can belong in one group when their results inform the same decision.
+- Different groups create independent completion units. Wake-capable sessions deliver separate messages; persist-only API sessions save a separate history row for each unit after delivery.
 
-This is off by default because every unit is a new turn for the orchestrator: a 15-task call becomes up to 15 wake-ups, which fragmented long campaigns. Grouping controls **result delivery, not execution order**: all tasks still run in parallel. If task B needs task A's output to do its work, dispatch A first, then dispatch B with that output after A returns.
+This is off by default because, on wake-capable sessions, every unit starts a new turn for the orchestrator: a 15-task call can create up to 15 wake-ups, which fragmented long campaigns. Persist-only API sessions can instead receive up to 15 history rows without any model wake. Grouping controls **result delivery, not execution order**: all tasks still run in parallel. If task B needs task A's output to do its work, dispatch A first, then dispatch B with that output after A returns.
 
 ```json
 {"tasks": [
@@ -537,7 +539,7 @@ The parent agent orchestrates its own running children with the same `delegate_t
 
 - **`list`** returns the conversation's live children: `subagent_id`, goal, status, `running_seconds`, `accepting_steer`, and the live transcript path. Ids also come back in the spawn dispatch response as `subagent_ids`.
 - **`steer`** queues a course correction into a running child without stopping it (delivery semantics below).
-- **`stop`** ends a child early at its next iteration boundary; the partial result still re-enters the conversation as a normal completion message.
+- **`stop`** ends a child early at its next iteration boundary. Its partial result follows the owning session's delivery path: a completion message on wake-capable sessions, or a history row for persist-only API sessions.
 
 Control actions run synchronously in-turn (never backgrounded), are scoped to the caller's own spawn tree — a conversation can never see or control another session's children — and never consume the per-turn subagent spawn cap, so `stop` keeps working even after the cap is hit.
 
@@ -682,14 +684,14 @@ and delegation follows the schema the model sees.
 ## Lifetime and Durability
 
 :::warning Background completion durability is not durable execution
-Top-level model-facing `delegate_task` calls run in the background automatically where the session supports later delivery. Hermes returns a handle immediately, and the result re-enters the conversation after the child or batch finishes. Orchestrator subagents wait for their workers in the current turn because they must synthesize those results before returning. Stateless request/response endpoints fall back to synchronous execution when they cannot deliver a detached result later.
+Top-level model-facing `delegate_task` calls run in the background automatically where the session supports detached delivery. Hermes returns a handle immediately. Wake-capable sessions deliver completed results as new messages; API-server requests with declared resumable session history persist a delivery row without starting a model turn, so a later eligible client turn can use it after delivery. Sessions without a detached-result consumer run the work synchronously. Orchestrator subagents wait for their workers in the current turn because they must synthesize those results before returning.
 
 - Normal follow-up messages do not cancel background children, and neither does stopping the current turn: Ctrl+C, Esc, the Desktop/TUI Stop button and an ACP cancel end only the turn. The `/stop` command (gateway `/stop` — also when the session is idle after the dispatching turn ended — or CLI `/stop`) ends the session's running background delegations, and closing or resetting the owning session does the same.
 - Explicit session close/reset interrupts that session's background children. In the CLI and TUI, the gateway owns the session and the client only views it: when the last viewer exits or runs `/new` (a TUI resume switch counts too), the gateway interrupts that session's background children at once and refuses new ones for it until a viewer opens the session again. A plain detach cancels nothing: closing Desktop, a dropped connection, or exiting while another viewer is still attached leaves the work running. Background processes (`terminal(background=True)`) keep running either way.
 - A completion for a CLI or TUI session — a background child's result (including an interrupted one), or a `notify_on_complete` process exit or watch-pattern notice — that reaches the head of the session's queue while no viewer is attached does not start a turn. It is written into the session as a note, and the next turn reads it (for example after `hermes chat --resume`). If a viewer is attached by then, including one that came back after the completion arrived, the completion runs as a turn as before. Messaging chats have no viewers and are unchanged: their completions still start a turn.
 - A Hermes process restart does **not** resume a running child. Its attempt becomes `unknown` because Hermes cannot prove which side effects happened.
 - A child that completed before restart but whose result was not delivered is restored and routed back through the owning session's normal checks.
-- Stopped children return a structured result (`status="interrupted"`, `exit_reason="interrupted"`) whose `summary` is the last text the child produced before the stop (the interrupt placeholder moves to `error`). The stop recurses down the spawn tree — an orchestrator child's synchronous workers are interrupted first and their partial results roll up into the child's own interrupted result — and each background unit's result re-enters the conversation right away as its normal completion notice (`Subagent Task Interrupted: …`), so nothing waits for the child to exhaust its budget.
+- Stopped children return a structured result (`status="interrupted"`, `exit_reason="interrupted"`) whose `summary` is the last text the child produced before the stop (the interrupt placeholder moves to `error`). The stop recurses down the spawn tree — an orchestrator child's synchronous workers are interrupted first and their partial results roll up into the child's own interrupted result — and each background unit's result follows the owning session's delivery path (a completion notice on wake-capable sessions, or a history row for persist-only API sessions), so nothing waits for the child to exhaust its budget.
 
 For **durable execution** that must survive session closure or process restart, use:
 
@@ -764,7 +766,7 @@ error.
 delegation:
   max_iterations: 250                       # Max turns per child (default: 250)
   # max_concurrent_children: 10             # Parallel children per batch (default: 10)
-  # independent_completions: false          # true = each task/group returns as it finishes (default: one message per call)
+  # independent_completions: false          # true = split into per-task/group completion units (default: one whole-call unit)
   # gateway_mode: auto                      # auto | inline | background (see Messaging chats without interim messages)
   # worktree_isolation: false               # Give each child its own git worktree (see Worktree Isolation above)
   # max_spawn_depth: 1                      # Tree depth (floor 1, no ceiling, default 1 = flat). Raise to 2 to allow orchestrator children to spawn leaves; 3+ for deeper trees.

@@ -911,7 +911,10 @@ def _dispatch(**kwargs) -> dict[str, Any]:
 
     with retirement.work() as admitted:
         if not admitted:
-            return {"status": "rejected", "error": "backend is retiring; reconnect to continue"}
+            return {
+                "status": "rejected", "reason": "backend_retiring",
+                "error": "backend is retiring; reconnect to continue",
+            }
         return _dispatch_admitted(**kwargs)
 
 
@@ -955,10 +958,13 @@ def _dispatch_admitted(
         "_progress_token": None, "_progress_ts": dispatched_at, "_interrupted_at": None}
     with _records_lock:
         if any((field, record[field]) in _refused_by for field in _FENCED_FIELDS):
-            return {"status": "rejected", "error": "This session was closed (exit or /new): no new background work."}
+            return {
+                "status": "rejected", "reason": "session_closed",
+                "error": "This session was closed (exit or /new): no new background work.",
+            }
         active_slots = {r.get("slot_key") or r["delegation_id"] for r in _records.values() if r.get("status") in _ACTIVE_STATES}
         if record["slot_key"] not in active_slots and len(active_slots) >= max_async_children:
-            return {"status": "rejected", "error": capacity_error}
+            return {"status": "rejected", "reason": "at_capacity", "error": capacity_error}
         _records[delegation_id] = record
         live_units = sum(1 for r in _records.values() if r.get("status") in _LIVE_STATES)
     _persist_dispatch(record)
@@ -1000,7 +1006,10 @@ def _dispatch_admitted(
         else:
             with _DB_LOCK, _transaction() as conn:
                 conn.execute("DELETE FROM async_delegations WHERE delegation_id=?", (delegation_id,))
-        return {"status": "rejected", "error": f"Failed to schedule async delegation{label}: {exc}"}
+        return {
+            "status": "rejected", "reason": "schedule_failed",
+            "error": f"Failed to schedule async delegation{label}: {exc}",
+        }
     if progress_fn is not None:
         _ensure_stale_monitor()
     return {"status": "dispatched", "delegation_id": delegation_id}
@@ -1016,7 +1025,8 @@ def dispatch_async_delegation(
     ``session_key``/``parent_session_id`` are captured on the parent thread (the worker carries
     no contextvars) and route the completion back to the spawning session.
     ``progress_fn() -> (token, in_tool)`` enables stale monitoring; omitted = unmonitored.
-    Returns ``{"status": "dispatched", "delegation_id"}`` or ``{"status": "rejected", "error"}``."""
+    Returns ``{"status": "dispatched", "delegation_id"}`` or a rejected handle with
+    ``status``, ``reason``, and ``error``."""
     delegation_id = _new_delegation_id()
     handle = _dispatch(
         delegation_id=delegation_id, goal=goal, goals=None, context=context,
@@ -1025,8 +1035,8 @@ def dispatch_async_delegation(
         origin_ui_session_id=origin_ui_session_id, origin_session_id=origin_session_id,
         interrupt_fn=interrupt_fn, max_async_children=max_async_children, progress_fn=progress_fn,
         capacity_error=(
-            f"Async delegation capacity reached ({max_async_children} running). Wait for one to finish "
-            "(its result will re-enter the chat), or run this task synchronously (background=false). "
+            f"Async delegation capacity reached ({max_async_children} running). Wait for capacity to free up "
+            "or run this task synchronously (background=false). "
             "Raise delegation.max_concurrent_children in config.yaml to allow more concurrent background subagents."))
     if handle["status"] == "dispatched":
         logger.info("Dispatched async delegation %s (session_key=%s): %s",
@@ -1061,8 +1071,8 @@ def dispatch_async_delegation_batch(
         interrupt_fn=interrupt_fn, max_async_children=max_async_children, progress_fn=progress_fn, slot_key=slot_key,
         task_indexes=task_indexes, task_transcripts=task_transcripts,
         capacity_error=(
-            f"Async delegation capacity reached ({max_async_children} running). Wait for one to finish "
-            "(its result will re-enter the chat), or raise delegation.max_concurrent_children in "
+            f"Async delegation capacity reached ({max_async_children} running). Wait for capacity to free up "
+            "or raise delegation.max_concurrent_children in "
             "config.yaml to allow more concurrent background units."))
     if handle["status"] == "dispatched":
         logger.info("Dispatched async delegation batch %s (%d task(s), session_key=%s)",

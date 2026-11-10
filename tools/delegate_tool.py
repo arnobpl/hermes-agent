@@ -591,8 +591,8 @@ def delegate_task(
         )
 
     top_role = _normalize_role(role)
-    # background applies to single tasks AND batches: a batch is ONE async unit
-    # that joins on every child and re-enters as a single consolidated message.
+    # A batch shares one capacity slot; _units_of may split its children into
+    # completion units. Delivery follows the originating session's wake/persist path.
     background = is_truthy_value(background, default=False) if background is not None else False
 
     depth = getattr(parent_agent, "_delegate_depth", 0)
@@ -705,14 +705,25 @@ def _build_top_level_description(*, independent_completions=None) -> str:
     delivery = _DELIVERY_INDEPENDENT if independent_completions else _DELIVERY_JOINED
     return _DESCRIPTION_HEAD.format(delivery=delivery) + restrictions_rule + _DESCRIPTION_TAIL
 
-_DELIVERY_INDEPENDENT, _DELIVERY_JOINED = "each ungrouped task / `group` returns on its own", "one message per call"
+_DELIVERY_INDEPENDENT, _DELIVERY_JOINED = (
+    "each ungrouped task / `group` is its own completion unit",
+    "one completion unit for the whole call",
+)
 
 _DESCRIPTION_DELIVERY = (
-    "Sessions without a later-result consumer (including one-shot CLI and cron) join parallel children "
+    "Sessions without a detached-result consumer (including one-shot CLI and cron) join parallel children "
     "and return results in this tool call. "
-    "Otherwise runs in the background: dispatch returns live transcript paths and results re-enter "
-    "as a new message when subagents finish ({delivery}). Background results are delivered only "
-    "BETWEEN your turns: finish whatever does not depend on them, then give a one-line status and END YOUR TURN. Never "
+    "Otherwise, Hermes runs the call in the background when the async pool has capacity and dispatch returns live "
+    "transcript paths. If the first unit cannot be admitted because the pool is full or scheduling fails, the call "
+    "runs synchronously with an explanatory note. Later capacity or scheduling failures run inline and appear under "
+    "`inline_results`; units refused because the session closed, the backend is retiring, or another non-fallback "
+    "reason are not started and appear under `not_dispatched` (or as an error with those results if no unit was accepted). "
+    "On wake-capable sessions, completed units re-enter as new messages ({delivery}). If a CLI/TUI completion reaches the head of the queue while no viewer "
+    "attached, Hermes saves it as a note for the next turn instead of starting a turn. Persist-only API sessions save completed results to "
+    "session history when the request declares resumable server-history continuation; the assistant can use them on "
+    "a later eligible turn after delivery, and no automatic follow-up starts (see dispatch note). Push-delivered "
+    "background results arrive only BETWEEN your turns: finish whatever does not depend on them, then give a one-line "
+    "status and END YOUR TURN. Never "
     "wait or poll on transcripts, artifact files, or CI for a child. "
     "While children run, `action` (list/steer/stop) controls them live.\n\n"
 )
@@ -916,10 +927,10 @@ from tools.registry import registry, tool_error
 
 def _model_background_value(args: dict, parent_agent=None) -> bool:
     """Background flag for the MODEL-facing dispatch path (registry fallback). Top-level delegations always run in the
-    background — the model does not choose — for single tasks and fan-out batches alike (one async unit, one
-    consolidated result); an orchestrator subagent (depth > 0) is the exception since it needs its workers' results
-    within its own turn. The live path is ``run_agent._dispatch_delegate_task``; this mirrors it for the rare case
-    the intercept is bypassed. Direct Python callers keep the synchronous default."""
+    background — the model does not choose — for single tasks and fan-out batches alike; configured independent
+    completions may split a batch into multiple units. An orchestrator subagent (depth > 0) is the exception since it
+    needs its workers' results within its own turn. The live path is ``run_agent._dispatch_delegate_task``; this
+    mirrors it for the rare case the intercept is bypassed. Direct Python callers keep the synchronous default."""
     return not getattr(parent_agent, "_delegate_depth", 0) > 0
 
 _MODEL_HIDDEN_TASK_FIELDS = {"acp_command", "acp_args"}

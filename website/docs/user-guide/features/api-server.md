@@ -579,10 +579,12 @@ synchronously, returning the result in the original turn. Merely deriving a
 session ID from request content does not enable detached delivery.
 
 For resumable requests, the completion is persisted once per delegation unit.
-It is available through `GET /api/sessions/{id}/messages` and in the next real
-client turn's session history. Retries do not insert the same result again;
-interim task-failure notices have separate identities. Delivery waits while a
-client turn owns the session lease and follows compression continuations.
+After delivery, it is available through `GET /api/sessions/{id}/messages` and
+the session history of a later real client turn. A turn that starts before the
+completion is delivered may not include it. Retries do not insert the same
+result again; interim task-failure notices have separate identities. Delivery
+waits while a client turn owns the session lease and follows compression
+continuations.
 Chat Completions echoes the explicit session ID you supplied in both JSON and
 streaming responses; keep sending that ID even after compression.
 

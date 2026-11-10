@@ -216,6 +216,7 @@ def test_dispatch_rejected_at_capacity():
         session_key="", runner=blocker, max_async_children=2,
     )
     assert r3["status"] == "rejected"
+    assert r3["reason"] == "at_capacity"
     assert "capacity reached" in r3["error"]
     ev.set()
 
